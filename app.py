@@ -21,7 +21,13 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-HEADERS = {"User-Agent": USER_AGENT}
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
 RATING_ORDER = {"NR": 0, "BBB": 1, "A": 2, "AA": 3, "AAA": 4}
 
@@ -262,12 +268,26 @@ def clean_data(instruments: pd.DataFrame, quotes: pd.DataFrame, rules: pd.DataFr
 
 
 # ---------- scraping helpers ----------
-def get_page_text(url: str) -> str:
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+def fetch_url_content(url: str, prewarm_url: str | None = None) -> tuple[str, str]:
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    if prewarm_url:
+        try:
+            session.get(prewarm_url, timeout=20)
+        except Exception:
+            pass
+    resp = session.get(url, timeout=20, allow_redirects=True)
     resp.raise_for_status()
     resp.encoding = "utf-8"
-    soup = BeautifulSoup(resp.text, "html.parser")
-    return soup.get_text("\n", strip=True)
+    html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    return html, text
+
+
+def get_page_text(url: str) -> str:
+    _, text = fetch_url_content(url)
+    return text
 
 
 def extract_numeric_pct(text: str | None) -> float | None:
@@ -296,37 +316,79 @@ def extract_after_label(text: str, label: str, pattern: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def extract_after_any_label(text: str, labels: list[str], pattern: str) -> str | None:
+    for label in labels:
+        val = extract_after_label(text, label, pattern)
+        if val:
+            return val
+    return None
+
+
+def tefas_field(text: str, html: str, labels: list[str], pattern: str) -> str | None:
+    for source in (text, html):
+        val = extract_after_any_label(source, labels, pattern)
+        if val:
+            return val
+    return None
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_tefas_fund(code: str) -> dict:
     code = code.strip().upper()
     if not code:
         raise ValueError("Fon kodu boş olamaz.")
     url = f"https://www.tefas.gov.tr/FonAnaliz.aspx?FonKod={code}"
-    text = get_page_text(url)
+    html, text = fetch_url_content(url, prewarm_url="https://www.tefas.gov.tr/")
 
-    name = extract_after_label(text, "Fon Detaylı Analiz", r"([A-ZÇĞİÖŞÜ0-9\-\(\)\.\s]+FON)")
-    category = extract_after_label(text, "Kategorisi", r"([A-Za-zÇĞİÖŞÜçğıöşü\s]+)")
-    daily_return_text = extract_after_label(text, "Günlük Getiri (%)", r"(%?[0-9\.,-]+)")
-    one_month_text = extract_after_label(text, "Son 1 Ay Getirisi", r"(%?[0-9\.,-]+)")
-    start_hour = extract_after_label(text, "İşlem Başlangıç Saati", r"([0-9]{2}:[0-9]{2})")
-    cutoff_hour = extract_after_label(text, "Son İşlem Saati", r"([0-9]{2}:[0-9]{2})")
-    buy_valor = extract_after_label(text, "Fon Alış Valörü", r"([0-9]+)")
-    sell_valor = extract_after_label(text, "Fon Satış Valörü", r"([0-9]+)")
-    max_buy_text = extract_after_label(text, "Max. Alış İşlem Miktarı", r"([0-9\.,]+)")
-    risk_value = extract_after_label(text, "Fonun Risk Değeri", r"([0-9]+)")
+    title_name = None
+    title_match = re.search(r"##\s+([^\n]+)", text)
+    if title_match:
+        title_name = title_match.group(1).strip()
 
-    daily_return = extract_numeric_pct(daily_return_text) or 0.0
-    one_month_return = extract_numeric_pct(one_month_text) or 0.0
+    name = title_name or tefas_field(text, html, ["Fon Detaylı Analiz"], r"([^\n]+)")
+    category = tefas_field(text, html, ["Kategorisi"], r"([A-Za-zÇĞİÖŞÜçğıöşü()\-\s]+)")
+    daily_return_text = tefas_field(text, html, ["Günlük Getiri (%)", "Gunluk Getiri (%)"], r"(%?[\-]?[0-9\.,]+)")
+    one_month_text = tefas_field(text, html, ["Son 1 Ay Getirisi"], r"(%?[\-]?[0-9\.,]+)")
+    start_hour = tefas_field(text, html, ["İşlem Başlangıç Saati", "Islem Baslangic Saati"], r"([0-9]{2}:[0-9]{2})")
+    cutoff_hour = tefas_field(text, html, ["Son İşlem Saati", "Son Islem Saati"], r"([0-9]{2}:[0-9]{2})")
+    buy_valor = tefas_field(text, html, ["Fon Alış Valörü", "Fon Alis Valoru"], r"([0-9]+)")
+    sell_valor = tefas_field(text, html, ["Fon Satış Valörü", "Fon Satis Valoru"], r"([0-9]+)")
+    max_buy_text = tefas_field(text, html, ["Max. Alış İşlem Miktarı", "Max. Alis Islem Miktari"], r"([0-9\.,]+)")
+    risk_value = tefas_field(text, html, ["Fonun Risk Değeri", "Fonun Risk Degeri"], r"([0-9]+)")
+
+    daily_return = extract_numeric_pct(daily_return_text)
+    one_month_return = extract_numeric_pct(one_month_text)
     max_buy_amount = extract_numeric_amount(max_buy_text)
+
+    parsed_points = sum(
+        x is not None and str(x).strip() != ""
+        for x in [name, category, daily_return_text, one_month_text, start_hour, cutoff_hour, buy_valor, sell_valor]
+    )
+    if parsed_points < 4:
+        raise RuntimeError(
+            "TEFAS sayfası eksik döndü veya WAF nedeniyle değerler okunamadı. "
+            "Bu fonda otomatik güncelle güvenilir değil; manuel override kullan."
+        )
+
+    daily_return = 0.0 if daily_return is None else daily_return
+    one_month_return = 0.0 if one_month_return is None else one_month_return
 
     annualized_daily = daily_return * 365
     annualized_monthly = one_month_return * 12
-    annualized_proxy = annualized_daily if daily_return > 0 else annualized_monthly
+    if daily_return > 0:
+        annualized_proxy = annualized_daily
+    elif one_month_return > 0:
+        annualized_proxy = annualized_monthly
+    else:
+        annualized_proxy = max(annualized_daily, annualized_monthly)
+
+    if annualized_proxy <= 0 and (daily_return == 0 and one_month_return == 0):
+        raise RuntimeError("TEFAS getiri alanları okunamadı; 0 değer ile quote güncellenmedi.")
 
     return {
         "fund_code": code,
-        "instrument_name": name or code,
-        "category": category or "",
+        "instrument_name": (name or code).strip(),
+        "category": (category or "").strip(),
         "daily_return_pct": round(daily_return, 6),
         "one_month_return_pct": round(one_month_return, 6),
         "annualized_proxy_pct": round(annualized_proxy, 2),
@@ -342,11 +404,14 @@ def fetch_tefas_fund(code: str) -> dict:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_borsa_index_info(index_url: str) -> dict:
-    text = get_page_text(index_url)
+    html, text = fetch_url_content(index_url)
 
     def _extract(label: str):
-        m = re.search(rf"{re.escape(label)}\s*([0-9\.,]+)", text, flags=re.IGNORECASE)
-        return extract_numeric_amount(m.group(1)) if m else None
+        for source in (text, html):
+            m = re.search(rf"{re.escape(label)}\s*([0-9\.,]+)", source, flags=re.IGNORECASE)
+            if m:
+                return extract_numeric_amount(m.group(1))
+        return None
 
     current_val = _extract("Current Value")
     previous_close = _extract("Previous Close")
@@ -364,30 +429,44 @@ def fetch_borsa_index_info(index_url: str) -> dict:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_tpp_public_reference() -> dict:
-    # best-effort parser; page structure may change
+def fetch_tpp_public_reference() -> dict | None:
     candidates = [
         "https://www.takasbank.com.tr/tr/istatistikler/takasbank-para-piyasasi-tpp/tpp-gunluk-bulten",
         "https://www.takasbank.com.tr/tr/istatistikler/takasbank-para-piyasasi-tpp/tpp-islem-ortalamalari-raporu",
     ]
-    last_error = None
     for url in candidates:
         try:
-            text = get_page_text(url)
+            html, text = fetch_url_content(url)
+            searchable = [text, html]
             patterns = [
-                r"O/?N[^\n]{0,80}?([0-9]{1,2}[\.,][0-9]{1,4})",
-                r"Gecelik[^\n]{0,80}?([0-9]{1,2}[\.,][0-9]{1,4})",
-                r"Ağırlıklı Ortalama Faiz[^\n]{0,80}?([0-9]{1,2}[\.,][0-9]{1,4})",
+                r"O/?N[^\n]{0,120}?([0-9]{1,2}[\.,][0-9]{1,4})",
+                r"Gecelik[^\n]{0,120}?([0-9]{1,2}[\.,][0-9]{1,4})",
+                r"Ağırlıklı Ortalama Faiz[^\n]{0,120}?([0-9]{1,2}[\.,][0-9]{1,4})",
+                r"ortalama[^\n]{0,120}?faiz[^\n]{0,120}?([0-9]{1,2}[\.,][0-9]{1,4})",
             ]
-            for p in patterns:
-                m = re.search(p, text, flags=re.IGNORECASE)
-                if m:
-                    rate = extract_numeric_pct(m.group(1))
-                    if rate is not None:
-                        return {"rate": rate, "url": url, "method": "regex"}
-        except Exception as e:  # pragma: no cover - network failures are expected in some environments
-            last_error = e
-    raise RuntimeError(f"TPP kamuya açık referans verisi okunamadı: {last_error}")
+            for source in searchable:
+                for p in patterns:
+                    m = re.search(p, source, flags=re.IGNORECASE)
+                    if m:
+                        rate = extract_numeric_pct(m.group(1))
+                        if rate is not None:
+                            return {"rate": rate, "url": url, "method": "regex"}
+            try:
+                tables = pd.read_html(html)
+                for tbl in tables:
+                    tbl = tbl.fillna("").astype(str)
+                    joined = " ".join(tbl.stack().tolist())
+                    for p in patterns:
+                        m = re.search(p, joined, flags=re.IGNORECASE)
+                        if m:
+                            rate = extract_numeric_pct(m.group(1))
+                            if rate is not None:
+                                return {"rate": rate, "url": url, "method": "table"}
+            except Exception:
+                pass
+        except Exception:
+            continue
+    return None
 
 
 def derived_repo_rate_from_index(index_info: dict) -> float | None:
@@ -538,40 +617,55 @@ def refresh_public_reference_quotes(instruments_df: pd.DataFrame, quotes_df: pd.
         repo_rate = derived_repo_rate_from_index(repo_info)
         benchmarks["repo"] = repo_info | {"derived_rate": repo_rate}
         if repo_rate is not None and "repo_on" in instruments_df["instrument_id"].values:
-            row = build_quote_row(
-                instrument_id="repo_on",
-                gross_yield=repo_rate,
-                fee_bps=2,
-                tax_bps=0,
-                quote_confirmed=False,
-                capacity_available=True,
-                source="BIST-KYD Repo (Gross) türetilmiş referans",
-                notes="Kamuya açık endeks değişiminden türetilen referans; executable quote yerine benchmark olarak düşün.",
-                valid_until=valid_until_by_cutoff("17:15"),
-            )
-            quotes = upsert_quote(quotes, row)
-            refreshed.append({"instrument_id": "repo_on", "label": "Repo referansı", "gross_yield": repo_rate, "source": row["source"]})
+            existing = latest_quotes(quotes)
+            existing_repo = existing[existing["instrument_id"] == "repo_on"]
+            has_manual = (not existing_repo.empty) and bool(existing_repo.iloc[0].get("quote_confirmed", False))
+            if not has_manual:
+                row = build_quote_row(
+                    instrument_id="repo_on",
+                    gross_yield=repo_rate,
+                    fee_bps=2,
+                    tax_bps=0,
+                    quote_confirmed=False,
+                    capacity_available=True,
+                    source="BIST-KYD Repo (Gross) türetilmiş referans",
+                    notes="Kamuya açık endeks değişiminden türetilen referans; executable quote yerine benchmark olarak düşün.",
+                    valid_until=valid_until_by_cutoff("17:15"),
+                )
+                quotes = upsert_quote(quotes, row)
+                refreshed.append({"instrument_id": "repo_on", "label": "Repo referansı", "gross_yield": repo_rate, "source": row["source"]})
+            else:
+                refreshed.append({"instrument_id": "repo_on", "label": "Repo referansı", "gross_yield": repo_rate, "source": "Benchmark bulundu ama teyitli manuel quote korunuyor"})
     except Exception as e:
         errors.append(f"Repo benchmark çekilemedi: {e}")
 
     # TPP reference best effort
     try:
         tpp_info = fetch_tpp_public_reference()
-        benchmarks["tpp"] = tpp_info
-        if "tpp_on" in instruments_df["instrument_id"].values:
-            row = build_quote_row(
-                instrument_id="tpp_on",
-                gross_yield=tpp_info["rate"],
-                fee_bps=1,
-                tax_bps=0,
-                quote_confirmed=False,
-                capacity_available=True,
-                source="Takasbank kamuya açık referans",
-                notes="Kamuya açık sayfadan best-effort çekim; mümkünse kurum ekranıyla teyit et.",
-                valid_until=valid_until_by_cutoff("15:30"),
-            )
-            quotes = upsert_quote(quotes, row)
-            refreshed.append({"instrument_id": "tpp_on", "label": "TPP referansı", "gross_yield": tpp_info["rate"], "source": row["source"]})
+        if tpp_info is None:
+            errors.append("TPP kamuya açık sayfasından oran okunamadı; TPP için manuel override kullan.")
+        else:
+            benchmarks["tpp"] = tpp_info
+            if "tpp_on" in instruments_df["instrument_id"].values:
+                existing = latest_quotes(quotes)
+                existing_tpp = existing[existing["instrument_id"] == "tpp_on"]
+                has_manual = (not existing_tpp.empty) and bool(existing_tpp.iloc[0].get("quote_confirmed", False))
+                if not has_manual:
+                    row = build_quote_row(
+                        instrument_id="tpp_on",
+                        gross_yield=tpp_info["rate"],
+                        fee_bps=1,
+                        tax_bps=0,
+                        quote_confirmed=False,
+                        capacity_available=True,
+                        source="Takasbank kamuya açık referans",
+                        notes="Kamuya açık sayfadan best-effort çekim; mümkünse kurum ekranıyla teyit et.",
+                        valid_until=valid_until_by_cutoff("15:30"),
+                    )
+                    quotes = upsert_quote(quotes, row)
+                    refreshed.append({"instrument_id": "tpp_on", "label": "TPP referansı", "gross_yield": tpp_info["rate"], "source": row["source"]})
+                else:
+                    refreshed.append({"instrument_id": "tpp_on", "label": "TPP referansı", "gross_yield": tpp_info["rate"], "source": "Benchmark bulundu ama teyitli manuel quote korunuyor"})
     except Exception as e:
         errors.append(f"TPP benchmark çekilemedi: {e}")
 
@@ -909,9 +1003,10 @@ with tab2:
                 st.success(f"{len(refreshed)} fon güncellendi.")
                 st.dataframe(pd.DataFrame(refreshed), use_container_width=True, hide_index=True)
             if errors:
-                st.warning("Bazı fonlar güncellenemedi:")
+                st.warning("Bazı fonlar güncellenemedi veya güvenilir okunamadı:")
                 for err in errors:
                     st.write(f"- {err}")
+                st.info("Bu durumda mevcut CSV quote'larını koruyup yalnızca teyitli manuel quote ile devam et.")
 
     st.markdown("### 2) Kamuya açık referansları çek")
     st.caption("Repo ve TPP tarafında kamuya açık veriden best-effort referans üretir. İşlem yapılabilir oran yerine benchmark olarak düşün.")
@@ -935,7 +1030,10 @@ with tab2:
     if single_submit:
         try:
             info = fetch_tefas_fund(tefas_code)
-            st.success("Fon verisi çekildi.")
+            if info.get("annualized_proxy_pct", 0) <= 0:
+                st.warning("Fon sayfası açıldı ama getiri alanları güvenilir okunmadı. Bu fonu otomatik quote olarak kullanma.")
+            else:
+                st.success("Fon verisi çekildi.")
             st.json(info)
         except Exception as e:
             st.error(f"Fon verisi çekilemedi: {e}")
