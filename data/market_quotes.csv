@@ -1,8 +1,0 @@
-instrument_id,quote_timestamp,quote_valid_until,gross_yield,fee_bps,tax_bps,net_yield,quote_confirmed,capacity_available,source,notes
-repo_on,2026-04-08 16:10,2026-04-08 17:15,41.2,2,0,41.18,True,True,Indicative market reference,Örnek veri
-tpp_on,2026-04-08 15:05,2026-04-08 15:30,41.35,1,0,41.34,True,True,Indicative market reference,Örnek veri
-ppf_alpha,2026-04-08 12:55,2026-04-08 13:30,40.1,10,0,40.0,True,True,Illustrative fund carry,Örnek veri
-ppf_beta,2026-04-08 12:50,2026-04-08 13:30,39.85,12,0,39.73,True,True,Illustrative fund carry,Örnek veri
-kvbaf_delta,2026-04-08 12:20,2026-04-08 17:45,40.75,14,0,40.61,True,True,Illustrative fund carry,Örnek veri
-mevduat_bank_a,2026-04-08 15:45,2026-04-08 16:30,43.0,0,0,43.0,True,True,Manual bank quote,Örnek veri
-katilim_bank_b,2026-04-08 15:35,2026-04-08 16:00,42.3,0,0,42.3,True,True,Manual participation quote,Örnek veri
