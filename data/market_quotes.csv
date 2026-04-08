@@ -1,0 +1,5 @@
+﻿instrument_id,quote_timestamp,quote_valid_until,gross_yield,fee_bps,tax_bps,net_yield,quote_confirmed,capacity_available,source,notes;;
+kvbaf_delta,2026-04-08 14:31:30.023083,2026-04-08 17:30:00,0.47,14.0,0.0,0.32999999999999996,True,True,TEFAS AAV,Günlük getiri %-1.4192; 1A %0.04; proxy yıllıklandırılmış %0.47
+ppf_alpha,2026-04-08 14:31:16.057854,2026-04-08 13:30:00,39.86,10.0,0.0,39.76,True,True,TEFAS AC4,Günlük getiri %0.1092; 1A %3.20; proxy yıllıklandırılmış %39.86
+ppf_beta,2026-04-08 14:31:23.221187,2026-04-08 13:30:00,39.53,10.0,0.0,39.43,True,True,TEFAS TI1,Günlük getiri %0.1083; 1A %3.01; proxy yıllıklandırılmış %39.53
+repo_on,2026-04-08 14:38:09.662055,2026-04-08 17:15:00,40.0,0.0,0.0,40.0,True,True,ForInvest Repo T0-ON,;;
