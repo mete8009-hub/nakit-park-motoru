@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,20 +21,82 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+HEADERS = {"User-Agent": USER_AGENT}
 
 RATING_ORDER = {"NR": 0, "BBB": 1, "A": 2, "AA": 3, "AAA": 4}
 
 INSTRUMENT_TYPE_DEFAULTS = {
-    "Repo": {"same_day_cutoff": "17:15", "supports_same_day": True, "supports_forward_value": True, "base_liquidity_score": 90, "base_operational_friction": 15},
-    "TPP": {"same_day_cutoff": "15:30", "supports_same_day": True, "supports_forward_value": True, "base_liquidity_score": 85, "base_operational_friction": 20},
-    "PPF": {"same_day_cutoff": "13:30", "supports_same_day": True, "supports_forward_value": True, "base_liquidity_score": 78, "base_operational_friction": 10},
-    "KVBAF": {"same_day_cutoff": "13:30", "supports_same_day": False, "supports_forward_value": True, "base_liquidity_score": 62, "base_operational_friction": 18},
-    "Mevduat": {"same_day_cutoff": "16:30", "supports_same_day": True, "supports_forward_value": True, "base_liquidity_score": 68, "base_operational_friction": 25},
-    "Katılım": {"same_day_cutoff": "16:00", "supports_same_day": True, "supports_forward_value": True, "base_liquidity_score": 65, "base_operational_friction": 25},
+    "Repo": {
+        "same_day_cutoff": "17:15",
+        "supports_same_day": True,
+        "supports_forward_value": True,
+        "base_liquidity_score": 90,
+        "base_operational_friction": 15,
+    },
+    "TPP": {
+        "same_day_cutoff": "15:30",
+        "supports_same_day": True,
+        "supports_forward_value": True,
+        "base_liquidity_score": 85,
+        "base_operational_friction": 20,
+    },
+    "PPF": {
+        "same_day_cutoff": "13:30",
+        "supports_same_day": True,
+        "supports_forward_value": True,
+        "base_liquidity_score": 78,
+        "base_operational_friction": 10,
+    },
+    "KVBAF": {
+        "same_day_cutoff": "13:30",
+        "supports_same_day": False,
+        "supports_forward_value": True,
+        "base_liquidity_score": 62,
+        "base_operational_friction": 18,
+    },
+    "Mevduat": {
+        "same_day_cutoff": "16:30",
+        "supports_same_day": True,
+        "supports_forward_value": True,
+        "base_liquidity_score": 68,
+        "base_operational_friction": 25,
+    },
+    "Katılım": {
+        "same_day_cutoff": "16:00",
+        "supports_same_day": True,
+        "supports_forward_value": True,
+        "base_liquidity_score": 65,
+        "base_operational_friction": 25,
+    },
+}
+
+REFERENCE_SOURCES = {
+    "repo_benchmark": {
+        "label": "BIST-KYD Repo (Gross)",
+        "url": "https://www.borsaistanbul.com/en/index/repbr",
+        "notes": "Endeksteki bugünkü değişimden yaklaşık yıllıklandırılmış referans repo seviyesi türetilir.",
+    },
+    "tpp_benchmark": {
+        "label": "Takasbank TPP",
+        "url": "https://www.takasbank.com.tr/tr/istatistikler/takasbank-para-piyasasi-tpp/tpp-gunluk-bulten",
+        "notes": "Kamuya açık sayfadaki günlük O/N faiz bilgisi bulunursa kullanılır; bulunamazsa manuel override gerekir.",
+    },
+    "tlref_reference": {
+        "label": "TLREF sayfası",
+        "url": "https://www.borsaistanbul.com/en/indices/tlref",
+        "notes": "Benchmark kutusunda gösterim içindir; doğrudan executable quote değildir.",
+    },
 }
 
 
-# ---------- helpers ----------
+# ---------- generic helpers ----------
+def safe_float(x, default=np.nan):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
 def parse_bool(series: pd.Series) -> pd.Series:
     return (
         series.astype(str)
@@ -42,6 +105,35 @@ def parse_bool(series: pd.Series) -> pd.Series:
         .map({"true": True, "false": False, "1": True, "0": False, "yes": True, "no": False})
         .fillna(False)
     )
+
+
+def normalize_value(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value).strip().upper()
+
+
+def split_pipe_values(value) -> list[str]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    return [x.strip() for x in str(value).split("|") if x.strip()]
+
+
+def format_currency(x: float) -> str:
+    if pd.isna(x):
+        return "-"
+    return f"{x:,.0f} TL".replace(",", ".")
+
+
+def format_pct(x: float) -> str:
+    if pd.isna(x):
+        return "-"
+    return f"%{x:.2f}"
+
+
+def dataframe_to_csv_download(df: pd.DataFrame, filename: str, label: str):
+    csv = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
 
 
 def load_default_csv(filename: str) -> pd.DataFrame:
@@ -56,21 +148,50 @@ def load_csv_or_default(uploaded_file, default_filename: str) -> pd.DataFrame:
 
 def ensure_columns(df: pd.DataFrame, required: dict[str, object]) -> pd.DataFrame:
     df = df.copy()
-    for col, default_value in required.items():
+    for col, default in required.items():
         if col not in df.columns:
-            df[col] = default_value
+            df[col] = default
     return df
 
 
-def clean_data(
-    instruments: pd.DataFrame,
-    quotes: pd.DataFrame,
-    rules: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def now_ist() -> datetime:
+    return datetime.now(IST).replace(tzinfo=None)
+
+
+def parse_datetime(value) -> pd.Timestamp | pd.NaT:
+    return pd.to_datetime(value, errors="coerce")
+
+
+def latest_quotes(quotes: pd.DataFrame) -> pd.DataFrame:
+    if quotes.empty:
+        return quotes.copy()
+    return quotes.sort_values(["instrument_id", "quote_timestamp"]).drop_duplicates("instrument_id", keep="last")
+
+
+def pct_score(series: pd.Series) -> pd.Series:
+    s = series.fillna(series.min() if series.notna().any() else 0)
+    if s.nunique(dropna=True) <= 1:
+        return pd.Series(np.full(len(s), 70.0), index=s.index)
+    return 100 * (s - s.min()) / (s.max() - s.min())
+
+
+def rating_value(rating: str) -> int:
+    return RATING_ORDER.get(normalize_value(rating), 0)
+
+
+def calculate_net_yield(gross_yield: float, fee_bps: float = 0.0, tax_bps: float = 0.0) -> float:
+    if pd.isna(gross_yield):
+        return np.nan
+    return float(gross_yield) - float(fee_bps or 0) / 100 - float(tax_bps or 0) / 100
+
+
+# ---------- data cleaning ----------
+def clean_data(instruments: pd.DataFrame, quotes: pd.DataFrame, rules: pd.DataFrame):
     instruments = ensure_columns(
         instruments,
         {
             "external_code": "",
+            "auto_source": "manual",
             "same_day_cutoff": "",
             "notes": "",
             "quote_required": False,
@@ -119,65 +240,38 @@ def clean_data(
     for col in ["participation_only_flag", "government_only_flag"]:
         rules[col] = parse_bool(rules[col])
 
-    numeric_cols_instruments = [
-        "min_amount",
-        "max_amount",
-        "max_horizon_days",
-        "base_liquidity_score",
-        "base_operational_friction",
-    ]
-    for col in numeric_cols_instruments:
+    for col in ["min_amount", "max_amount", "max_horizon_days", "base_liquidity_score", "base_operational_friction"]:
         instruments[col] = pd.to_numeric(instruments[col], errors="coerce")
 
-    numeric_cols_quotes = ["gross_yield", "fee_bps", "tax_bps", "net_yield"]
-    for col in numeric_cols_quotes:
+    for col in ["gross_yield", "fee_bps", "tax_bps", "net_yield"]:
         quotes[col] = pd.to_numeric(quotes[col], errors="coerce")
 
     quotes["quote_timestamp"] = pd.to_datetime(quotes["quote_timestamp"], errors="coerce")
     quotes["quote_valid_until"] = pd.to_datetime(quotes["quote_valid_until"], errors="coerce")
     rules["max_horizon_days"] = pd.to_numeric(rules["max_horizon_days"], errors="coerce")
 
+    # fill defaults by instrument type if missing
+    for idx, row in instruments.iterrows():
+        defaults = INSTRUMENT_TYPE_DEFAULTS.get(row["instrument_type"], {})
+        for col, val in defaults.items():
+            current = row.get(col)
+            if (isinstance(current, str) and not current.strip()) or pd.isna(current):
+                instruments.at[idx, col] = val
+
     return instruments, quotes, rules
 
 
-def latest_quotes(quotes: pd.DataFrame) -> pd.DataFrame:
-    return quotes.sort_values(["instrument_id", "quote_timestamp"]).drop_duplicates("instrument_id", keep="last")
+# ---------- scraping helpers ----------
+def get_page_text(url: str) -> str:
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+    soup = BeautifulSoup(resp.text, "html.parser")
+    return soup.get_text("\n", strip=True)
 
 
-def pct_score(series: pd.Series) -> pd.Series:
-    if series.nunique(dropna=True) <= 1:
-        return pd.Series(np.full(len(series), 70.0), index=series.index)
-    min_val = series.min()
-    max_val = series.max()
-    return 100 * (series - min_val) / (max_val - min_val)
-
-
-def normalize_value(value: str | None) -> str:
-    if value is None:
-        return ""
-    return str(value).strip().upper()
-
-
-def split_pipe_values(value: str | None) -> list[str]:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return []
-    return [x.strip() for x in str(value).split("|") if x.strip()]
-
-
-def format_currency(x: float) -> str:
-    if pd.isna(x):
-        return "-"
-    return f"{x:,.0f} TL".replace(",", ".")
-
-
-def dataframe_to_csv_download(df: pd.DataFrame, filename: str, label: str):
-    csv = df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
-
-
-# ---------- TEFAS scraping ----------
-def extract_numeric_pct(text: str) -> float | None:
-    if text is None:
+def extract_numeric_pct(text: str | None) -> float | None:
+    if not text:
         return None
     cleaned = text.strip().replace("%", "").replace(".", "").replace(",", ".")
     try:
@@ -186,8 +280,8 @@ def extract_numeric_pct(text: str) -> float | None:
         return None
 
 
-def extract_numeric_amount(text: str) -> float | None:
-    if text is None:
+def extract_numeric_amount(text: str | None) -> float | None:
+    if not text:
         return None
     cleaned = text.strip().replace(".", "").replace(",", ".")
     try:
@@ -198,8 +292,8 @@ def extract_numeric_amount(text: str) -> float | None:
 
 def extract_after_label(text: str, label: str, pattern: str) -> str | None:
     regex = rf"{re.escape(label)}\s*{pattern}"
-    match = re.search(regex, text, flags=re.IGNORECASE)
-    return match.group(1).strip() if match else None
+    m = re.search(regex, text, flags=re.IGNORECASE)
+    return m.group(1).strip() if m else None
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -207,14 +301,8 @@ def fetch_tefas_fund(code: str) -> dict:
     code = code.strip().upper()
     if not code:
         raise ValueError("Fon kodu boş olamaz.")
-
     url = f"https://www.tefas.gov.tr/FonAnaliz.aspx?FonKod={code}"
-    resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=20)
-    resp.raise_for_status()
-    resp.encoding = "utf-8"
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    text = soup.get_text("\n", strip=True)
+    text = get_page_text(url)
 
     name = extract_after_label(text, "Fon Detaylı Analiz", r"([A-ZÇĞİÖŞÜ0-9\-\(\)\.\s]+FON)")
     category = extract_after_label(text, "Kategorisi", r"([A-Za-zÇĞİÖŞÜçğıöşü\s]+)")
@@ -252,90 +340,242 @@ def fetch_tefas_fund(code: str) -> dict:
     }
 
 
-def upsert_quote(quotes_df: pd.DataFrame, new_row: dict) -> pd.DataFrame:
-    quotes_df = quotes_df.copy()
-    quotes_df = quotes_df[quotes_df["instrument_id"] != new_row["instrument_id"]]
-    quotes_df = pd.concat([quotes_df, pd.DataFrame([new_row])], ignore_index=True)
-    return quotes_df.sort_values(["instrument_id", "quote_timestamp"]).reset_index(drop=True)
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_borsa_index_info(index_url: str) -> dict:
+    text = get_page_text(index_url)
 
+    def _extract(label: str):
+        m = re.search(rf"{re.escape(label)}\s*([0-9\.,]+)", text, flags=re.IGNORECASE)
+        return extract_numeric_amount(m.group(1)) if m else None
 
-def upsert_instrument(instruments_df: pd.DataFrame, new_row: dict) -> pd.DataFrame:
-    instruments_df = instruments_df.copy()
-    instruments_df = instruments_df[instruments_df["instrument_id"] != new_row["instrument_id"]]
-    instruments_df = pd.concat([instruments_df, pd.DataFrame([new_row])], ignore_index=True)
-    return instruments_df.sort_values("instrument_id").reset_index(drop=True)
+    current_val = _extract("Current Value")
+    previous_close = _extract("Previous Close")
+    daily_change_pct = _extract("Change (%)")
+    index_date_match = re.search(r"(\d{2}\.\d{2}\.\d{4}|\d{1,2}/\d{1,2}/\d{4})", text)
+    index_date = index_date_match.group(1) if index_date_match else ""
 
-
-def apply_tefas_to_data(instruments_df: pd.DataFrame, quotes_df: pd.DataFrame, fund_data: dict) -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    instruments_df = instruments_df.copy()
-    quotes_df = quotes_df.copy()
-
-    match = instruments_df.loc[instruments_df["external_code"].astype(str).str.upper() == fund_data["fund_code"]]
-    instrument_id = None
-    action_text = ""
-    if not match.empty:
-        instrument_id = match.iloc[0]["instrument_id"]
-        row = match.iloc[0].to_dict()
-        row["instrument_name"] = fund_data["instrument_name"]
-        row["same_day_cutoff"] = fund_data["cutoff"]
-        if fund_data["max_buy_amount"]:
-            row["max_amount"] = fund_data["max_buy_amount"]
-        row["notes"] = f"TEFAS otomatik güncelleme | {fund_data['source_url']}"
-        instruments_df = upsert_instrument(instruments_df, row)
-        action_text = f"{fund_data['fund_code']} mevcut {instrument_id} satırına işlendi."
-    else:
-        category_upper = fund_data["category"].upper()
-        if "PARA PİYASASI" in category_upper:
-            instrument_type = "PPF"
-        elif "KISA VADELİ BORÇLANMA" in category_upper or "BORÇLANMA" in category_upper:
-            instrument_type = "KVBAF"
-        else:
-            instrument_type = "PPF"
-
-        defaults = INSTRUMENT_TYPE_DEFAULTS[instrument_type]
-        instrument_id = f"tefas_{fund_data['fund_code'].lower()}"
-        new_instrument = {
-            "instrument_id": instrument_id,
-            "instrument_name": fund_data["instrument_name"],
-            "instrument_type": instrument_type,
-            "provider_name": "TEFAS / Manuel Eşleme",
-            "issuer_type": "Fund",
-            "rating": "AA" if instrument_type == "PPF" else "A",
-            "min_amount": 1,
-            "max_amount": fund_data["max_buy_amount"] or 999999999,
-            "max_horizon_days": 30 if instrument_type == "PPF" else 90,
-            "quote_required": False,
-            "supports_same_day": defaults["supports_same_day"],
-            "supports_forward_value": defaults["supports_forward_value"],
-            "participation_flag": False,
-            "government_only_flag": False,
-            "base_liquidity_score": defaults["base_liquidity_score"],
-            "base_operational_friction": defaults["base_operational_friction"],
-            "same_day_cutoff": fund_data["cutoff"],
-            "active_flag": True,
-            "notes": f"TEFAS otomatik eklendi | {fund_data['source_url']}",
-            "external_code": fund_data["fund_code"],
-        }
-        instruments_df = upsert_instrument(instruments_df, new_instrument)
-        action_text = f"{fund_data['fund_code']} için yeni {instrument_id} satırı açıldı."
-
-    now_ist = datetime.now(IST).replace(tzinfo=None, second=0, microsecond=0)
-    quote_valid_until = datetime.combine(now_ist.date(), datetime.strptime(fund_data["cutoff"], "%H:%M").time())
-    new_quote = {
-        "instrument_id": instrument_id,
-        "quote_timestamp": now_ist,
-        "quote_valid_until": quote_valid_until,
-        "gross_yield": fund_data["annualized_proxy_pct"],
-        "fee_bps": 0,
-        "tax_bps": 0,
-        "net_yield": fund_data["annualized_proxy_pct"],
-        "quote_confirmed": True,
-        "capacity_available": True,
-        "source": f"TEFAS Auto | {fund_data['fund_code']}",
-        "notes": f"Günlük getiri %{fund_data['daily_return_pct']} | Son 1Ay %{fund_data['one_month_return_pct']}",
+    return {
+        "current_value": current_val,
+        "previous_close": previous_close,
+        "daily_change_pct": daily_change_pct,
+        "date": index_date,
+        "url": index_url,
     }
-    quotes_df = upsert_quote(quotes_df, new_quote)
-    return instruments_df, quotes_df, action_text
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_tpp_public_reference() -> dict:
+    # best-effort parser; page structure may change
+    candidates = [
+        "https://www.takasbank.com.tr/tr/istatistikler/takasbank-para-piyasasi-tpp/tpp-gunluk-bulten",
+        "https://www.takasbank.com.tr/tr/istatistikler/takasbank-para-piyasasi-tpp/tpp-islem-ortalamalari-raporu",
+    ]
+    last_error = None
+    for url in candidates:
+        try:
+            text = get_page_text(url)
+            patterns = [
+                r"O/?N[^\n]{0,80}?([0-9]{1,2}[\.,][0-9]{1,4})",
+                r"Gecelik[^\n]{0,80}?([0-9]{1,2}[\.,][0-9]{1,4})",
+                r"Ağırlıklı Ortalama Faiz[^\n]{0,80}?([0-9]{1,2}[\.,][0-9]{1,4})",
+            ]
+            for p in patterns:
+                m = re.search(p, text, flags=re.IGNORECASE)
+                if m:
+                    rate = extract_numeric_pct(m.group(1))
+                    if rate is not None:
+                        return {"rate": rate, "url": url, "method": "regex"}
+        except Exception as e:  # pragma: no cover - network failures are expected in some environments
+            last_error = e
+    raise RuntimeError(f"TPP kamuya açık referans verisi okunamadı: {last_error}")
+
+
+def derived_repo_rate_from_index(index_info: dict) -> float | None:
+    current_val = index_info.get("current_value")
+    previous_close = index_info.get("previous_close")
+    if not current_val or not previous_close or previous_close == 0:
+        return None
+    daily_return = current_val / previous_close - 1
+    annualized = daily_return * 365 * 100
+    if annualized < 0 or annualized > 1000:
+        return None
+    return annualized
+
+
+# ---------- quote management ----------
+def build_quote_row(
+    instrument_id: str,
+    gross_yield: float,
+    fee_bps: float = 0.0,
+    tax_bps: float = 0.0,
+    quote_confirmed: bool = True,
+    capacity_available: bool = True,
+    source: str = "",
+    notes: str = "",
+    valid_until: datetime | None = None,
+    quote_timestamp: datetime | None = None,
+) -> dict:
+    ts = quote_timestamp or now_ist()
+    vu = valid_until or (ts + timedelta(hours=1))
+    net_yield = calculate_net_yield(gross_yield, fee_bps, tax_bps)
+    return {
+        "instrument_id": instrument_id,
+        "quote_timestamp": ts,
+        "quote_valid_until": vu,
+        "gross_yield": gross_yield,
+        "fee_bps": fee_bps,
+        "tax_bps": tax_bps,
+        "net_yield": net_yield,
+        "quote_confirmed": quote_confirmed,
+        "capacity_available": capacity_available,
+        "source": source,
+        "notes": notes,
+    }
+
+
+def upsert_quote(quotes_df: pd.DataFrame, new_row: dict) -> pd.DataFrame:
+    q = quotes_df.copy()
+    q = q[q["instrument_id"] != new_row["instrument_id"]]
+    q = pd.concat([q, pd.DataFrame([new_row])], ignore_index=True)
+    return q.sort_values(["instrument_id", "quote_timestamp"]).reset_index(drop=True)
+
+
+def get_instrument_meta(instruments: pd.DataFrame, instrument_id: str) -> pd.Series:
+    rows = instruments[instruments["instrument_id"] == instrument_id]
+    if rows.empty:
+        raise KeyError(f"Instrument bulunamadı: {instrument_id}")
+    return rows.iloc[0]
+
+
+def valid_until_by_cutoff(cutoff_str: str | None, fallback_hours: int = 1) -> datetime:
+    ts = now_ist()
+    if cutoff_str:
+        try:
+            cutoff_time = datetime.strptime(str(cutoff_str), "%H:%M").time()
+            return datetime.combine(ts.date(), cutoff_time)
+        except Exception:
+            pass
+    return ts + timedelta(hours=fallback_hours)
+
+
+def add_manual_quote(
+    quotes_df: pd.DataFrame,
+    instruments_df: pd.DataFrame,
+    instrument_id: str,
+    gross_yield: float,
+    fee_bps: float,
+    tax_bps: float,
+    source: str,
+    notes: str,
+    quote_confirmed: bool,
+    capacity_available: bool,
+) -> pd.DataFrame:
+    meta = get_instrument_meta(instruments_df, instrument_id)
+    row = build_quote_row(
+        instrument_id=instrument_id,
+        gross_yield=gross_yield,
+        fee_bps=fee_bps,
+        tax_bps=tax_bps,
+        quote_confirmed=quote_confirmed,
+        capacity_available=capacity_available,
+        source=source,
+        notes=notes,
+        valid_until=valid_until_by_cutoff(meta.get("same_day_cutoff")),
+    )
+    return upsert_quote(quotes_df, row)
+
+
+def refresh_tefas_quotes(instruments_df: pd.DataFrame, quotes_df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], list[str]]:
+    quotes = quotes_df.copy()
+    refreshed = []
+    errors = []
+    funds = instruments_df[
+        instruments_df["auto_source"].astype(str).str.lower().eq("tefas") & instruments_df["external_code"].astype(str).str.strip().ne("")
+    ]
+    for _, row in funds.iterrows():
+        try:
+            info = fetch_tefas_fund(row["external_code"])
+            fee_bps = 10 if row["instrument_type"] == "PPF" else 14
+            quote_row = build_quote_row(
+                instrument_id=row["instrument_id"],
+                gross_yield=info["annualized_proxy_pct"],
+                fee_bps=fee_bps,
+                tax_bps=0,
+                quote_confirmed=True,
+                capacity_available=True,
+                source=f"TEFAS {info['fund_code']}",
+                notes=(
+                    f"Günlük getiri %{info['daily_return_pct']:.4f}; 1A %{info['one_month_return_pct']:.2f}; "
+                    f"proxy yıllıklandırılmış %{info['annualized_proxy_pct']:.2f}"
+                ),
+                valid_until=valid_until_by_cutoff(info.get("cutoff")),
+            )
+            quotes = upsert_quote(quotes, quote_row)
+            refreshed.append(
+                {
+                    "instrument_id": row["instrument_id"],
+                    "instrument_name": row["instrument_name"],
+                    "fund_code": info["fund_code"],
+                    "annualized_proxy_pct": info["annualized_proxy_pct"],
+                    "cutoff": info["cutoff"],
+                    "source_url": info["source_url"],
+                }
+            )
+        except Exception as e:
+            errors.append(f"{row['instrument_name']} ({row['external_code']}): {e}")
+    return quotes, refreshed, errors
+
+
+def refresh_public_reference_quotes(instruments_df: pd.DataFrame, quotes_df: pd.DataFrame) -> tuple[pd.DataFrame, list[dict], list[str], dict]:
+    quotes = quotes_df.copy()
+    refreshed = []
+    errors = []
+    benchmarks: dict[str, dict] = {}
+
+    # Repo benchmark from BIST-KYD repo gross index
+    try:
+        repo_info = fetch_borsa_index_info(REFERENCE_SOURCES["repo_benchmark"]["url"])
+        repo_rate = derived_repo_rate_from_index(repo_info)
+        benchmarks["repo"] = repo_info | {"derived_rate": repo_rate}
+        if repo_rate is not None and "repo_on" in instruments_df["instrument_id"].values:
+            row = build_quote_row(
+                instrument_id="repo_on",
+                gross_yield=repo_rate,
+                fee_bps=2,
+                tax_bps=0,
+                quote_confirmed=False,
+                capacity_available=True,
+                source="BIST-KYD Repo (Gross) türetilmiş referans",
+                notes="Kamuya açık endeks değişiminden türetilen referans; executable quote yerine benchmark olarak düşün.",
+                valid_until=valid_until_by_cutoff("17:15"),
+            )
+            quotes = upsert_quote(quotes, row)
+            refreshed.append({"instrument_id": "repo_on", "label": "Repo referansı", "gross_yield": repo_rate, "source": row["source"]})
+    except Exception as e:
+        errors.append(f"Repo benchmark çekilemedi: {e}")
+
+    # TPP reference best effort
+    try:
+        tpp_info = fetch_tpp_public_reference()
+        benchmarks["tpp"] = tpp_info
+        if "tpp_on" in instruments_df["instrument_id"].values:
+            row = build_quote_row(
+                instrument_id="tpp_on",
+                gross_yield=tpp_info["rate"],
+                fee_bps=1,
+                tax_bps=0,
+                quote_confirmed=False,
+                capacity_available=True,
+                source="Takasbank kamuya açık referans",
+                notes="Kamuya açık sayfadan best-effort çekim; mümkünse kurum ekranıyla teyit et.",
+                valid_until=valid_until_by_cutoff("15:30"),
+            )
+            quotes = upsert_quote(quotes, row)
+            refreshed.append({"instrument_id": "tpp_on", "label": "TPP referansı", "gross_yield": tpp_info["rate"], "source": row["source"]})
+    except Exception as e:
+        errors.append(f"TPP benchmark çekilemedi: {e}")
+
+    return quotes, refreshed, errors, benchmarks
 
 
 # ---------- scoring ----------
@@ -352,123 +592,114 @@ def score_candidates(
     government_pref: str,
     min_rating_user: str,
     evaluation_dt: datetime,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    merged = instruments.merge(latest_quotes(quotes), on="instrument_id", how="left", suffixes=("", "_quote"))
-    merged = merged[merged["active_flag"]].copy()
+):
+    latest = latest_quotes(quotes)
+    universe = instruments[instruments["active_flag"]].merge(latest, on="instrument_id", how="left", suffixes=("", "_q"))
 
-    rule = rules.loc[rules["portfolio_id"] == portfolio_id].iloc[0]
+    rule_rows = rules[rules["portfolio_id"] == portfolio_id]
+    if rule_rows.empty:
+        raise ValueError(f"Kural seti bulunamadı: {portfolio_id}")
+    rule = rule_rows.iloc[0]
     allowed_types = set(split_pipe_values(rule["allowed_instrument_types"]))
+    portfolio_min_rating = max(rating_value(rule["min_rating"]), rating_value(min_rating_user))
+    max_horizon = min(int(rule["max_horizon_days"]), int(horizon_days)) if not pd.isna(rule["max_horizon_days"]) else int(horizon_days)
 
-    require_same_day = planning_mode == "Bugün park et"
-    next_day_ok = planning_mode == "Yarın başlat"
-
-    min_rating_required = max(
-        RATING_ORDER.get(normalize_value(rule["min_rating"]), 0),
-        RATING_ORDER.get(normalize_value(min_rating_user), 0),
-    )
-
-    threshold_liquidity = {"T+0": 70, "T+1": 55, "Esnek": 0}[liquidity_need]
-
-    rows = []
+    eligible_rows = []
     rejected_rows = []
 
-    for _, row in merged.iterrows():
-        reasons: list[str] = []
-        blockers: list[str] = []
+    for _, row in universe.iterrows():
+        blocks = []
+        reasons = []
+        inst_type = row["instrument_type"]
+        cutoff = str(row["same_day_cutoff"]).strip() if pd.notna(row["same_day_cutoff"]) else ""
 
-        instrument_rating = RATING_ORDER.get(normalize_value(row.get("rating")), 0)
-        quote_exists = pd.notna(row.get("net_yield"))
-        quote_confirmed = bool(row.get("quote_confirmed", False))
-        capacity_available = bool(row.get("capacity_available", True))
-        cutoff = row.get("same_day_cutoff")
-        cutoff_time = None
-        if pd.notna(cutoff) and str(cutoff).strip():
-            try:
-                cutoff_time = datetime.strptime(str(cutoff), "%H:%M").time()
-            except ValueError:
-                cutoff_time = None
-
-        same_day_still_open = True
-        if cutoff_time is not None:
-            same_day_still_open = evaluation_dt.time() <= cutoff_time
-
-        if row["instrument_type"] not in allowed_types:
-            blockers.append("Fon kural setinde bu ürün tipi izinli değil.")
+        if allowed_types and inst_type not in allowed_types:
+            blocks.append("Fon kural setinde izinli değil")
         if amount < row["min_amount"]:
-            blockers.append(f"Minimum işlem tutarı {row['min_amount']:,.0f} TL.")
-        if amount > row["max_amount"]:
-            blockers.append(f"Maksimum işlem tutarı {row['max_amount']:,.0f} TL.")
+            blocks.append("Minimum tutarın altında")
+        if not pd.isna(row["max_amount"]) and amount > row["max_amount"]:
+            blocks.append("Maksimum tutarın üzerinde")
         if horizon_days > row["max_horizon_days"]:
-            blockers.append(f"Bu ürün için azami park süresi {int(row['max_horizon_days'])} gün.")
-        if horizon_days > rule["max_horizon_days"]:
-            blockers.append(f"Fon kural seti en fazla {int(rule['max_horizon_days'])} gün izin veriyor.")
-        if instrument_rating < min_rating_required:
-            blockers.append("Rating filtresini karşılamıyor.")
-        if rule["participation_only_flag"] and not row["participation_flag"]:
-            blockers.append("Fon sadece katılım uyumlu araçlara izin veriyor.")
-        if participation_pref == "Sadece katılım" and not row["participation_flag"]:
-            blockers.append("Kullanıcı filtresi sadece katılım istiyor.")
-        if participation_pref == "Katılım hariç" and row["participation_flag"]:
-            blockers.append("Kullanıcı filtresi katılım ürünlerini hariç tutuyor.")
-        if rule["government_only_flag"] and not row["government_only_flag"]:
-            blockers.append("Fon kural seti kamu odaklı araç istiyor.")
-        if government_pref == "Sadece kamu benzeri" and not row["government_only_flag"]:
-            blockers.append("Kullanıcı filtresi sadece kamu benzeri araç istiyor.")
-        if row["quote_required"] and (not quote_exists or not quote_confirmed):
-            blockers.append("Canlı/onaylı quote gerekli.")
-        if not capacity_available:
-            blockers.append("Kapasite uygun değil veya limit dolu.")
-        if require_same_day:
-            if not row["supports_same_day"]:
-                blockers.append("Aynı gün başlangıç desteklenmiyor.")
-            elif not same_day_still_open:
-                blockers.append("Aynı gün cutoff saati geçmiş.")
-        elif next_day_ok:
-            if not (row["supports_forward_value"] or row["supports_same_day"]):
-                blockers.append("İleri başlangıç için uygun değil.")
-        if row["base_liquidity_score"] < threshold_liquidity:
-            blockers.append("Likidite ihtiyacını karşılamıyor.")
+            blocks.append("Araç vade sınırını aşıyor")
+        if horizon_days > max_horizon:
+            blocks.append("Fon vade sınırını aşıyor")
+        if rating_value(row["rating"]) < portfolio_min_rating:
+            blocks.append("Rating eşiğinin altında")
+        if bool(rule["participation_only_flag"]) and not bool(row["participation_flag"]):
+            blocks.append("Fon sadece katılım uyumlu ürün kabul ediyor")
+        if participation_pref == "Sadece katılım" and not bool(row["participation_flag"]):
+            blocks.append("Katılım filtresine takıldı")
+        if participation_pref == "Katılım hariç" and bool(row["participation_flag"]):
+            blocks.append("Katılım hariç filtresine takıldı")
+        if bool(rule["government_only_flag"]) and not bool(row["government_only_flag"]):
+            blocks.append("Fon kamu benzeri ürün istiyor")
+        if government_pref == "Sadece kamu benzeri" and not bool(row["government_only_flag"]):
+            blocks.append("Kamu filtresine takıldı")
+        if liquidity_need == "T+0" and not bool(row["supports_same_day"]):
+            blocks.append("T+0 likiditeyi desteklemiyor")
+        if liquidity_need == "T+1" and not (bool(row["supports_same_day"]) or bool(row["supports_forward_value"])):
+            blocks.append("T+1 likidite için zayıf")
+        if bool(row["quote_required"]) and not bool(row["quote_confirmed"]):
+            blocks.append("Teyitli quote yok")
+        if not bool(row["capacity_available"]) and not pd.isna(row["capacity_available"]):
+            blocks.append("Kapasite uygun değil")
+        if pd.isna(row["net_yield"]):
+            blocks.append("Geçerli quote yok")
+        if planning_mode == "Bugün park et" and cutoff:
+            try:
+                cutoff_time = datetime.strptime(cutoff, "%H:%M").time()
+                if evaluation_dt.time() > cutoff_time:
+                    blocks.append("Bugünkü cutoff geçmiş")
+                else:
+                    reasons.append("Bugün içinde uygulanabilir")
+            except Exception:
+                pass
+        if planning_mode == "Yarın başlat":
+            reasons.append("Yarın başlangıç planı ile değerlendirildi")
 
-        if row["base_liquidity_score"] >= 80:
-            reasons.append("Likidite profili güçlü.")
-        elif row["base_liquidity_score"] >= 65:
-            reasons.append("Likidite profili yeterli.")
-        if row["base_operational_friction"] <= 12:
-            reasons.append("Operasyonel sürtünmesi düşük.")
-        elif row["base_operational_friction"] <= 20:
-            reasons.append("Operasyonel olarak yönetilebilir.")
-        if quote_exists and row["net_yield"] >= merged["net_yield"].dropna().median():
-            reasons.append("Net getiri seviyesi evren ortalamasının üzerinde.")
-        if require_same_day and same_day_still_open:
-            reasons.append("Bugün içinde uygulanabilir.")
-        elif next_day_ok and row["supports_forward_value"]:
-            reasons.append("İleri başlangıç için uygun.")
+        if inst_type in {"Repo", "TPP"}:
+            reasons.append("Likidite tarafı güçlü")
+        if inst_type == "PPF":
+            reasons.append("Operasyonel sürtünmesi düşük")
+        if inst_type == "KVBAF":
+            reasons.append("Biraz daha uzun parkta anlamlı olabilir")
+        if inst_type in {"Mevduat", "Katılım"}:
+            reasons.append("Karşı taraf quote kalitesi kritik")
 
-        eligible = len(blockers) == 0
-        days = max(int(horizon_days), 1)
-        net_yield = float(row["net_yield"]) if quote_exists else np.nan
-        gross_yield = float(row["gross_yield"]) if quote_exists else np.nan
-        expected_net_income = amount * (net_yield / 100) * (days / 365) if quote_exists else np.nan
+        if blocks:
+            rejected_rows.append(
+                {
+                    "Araç": row["instrument_name"],
+                    "Tür": inst_type,
+                    "Sağlayıcı": row["provider_name"],
+                    "Blokajlar": " | ".join(blocks),
+                    "Cutoff": cutoff or "-",
+                }
+            )
+            continue
 
-        payload = {
-            "instrument_id": row["instrument_id"],
-            "Araç": row["instrument_name"],
-            "Tür": row["instrument_type"],
-            "Sağlayıcı": row["provider_name"],
-            "Net Getiri (%)": round(net_yield, 2) if quote_exists else np.nan,
-            "Brüt Getiri (%)": round(gross_yield, 2) if quote_exists else np.nan,
-            "Beklenen Net TL Katkı": expected_net_income,
-            "Likidite Skoru": float(row["base_liquidity_score"]),
-            "Operasyonel Sürtünme": float(row["base_operational_friction"]),
-            "Cutoff": row["same_day_cutoff"],
-            "Notlar": row.get("notes", ""),
-            "Nedenler": " | ".join(reasons) if reasons else "",
-            "Blokajlar": " | ".join(blockers) if blockers else "",
-            "eligible": eligible,
-        }
-        (rows if eligible else rejected_rows).append(payload)
+        net_yield = float(row["net_yield"])
+        net_contribution = amount * net_yield / 100 * max(horizon_days, 1) / 365
+        eligible_rows.append(
+            {
+                "instrument_id": row["instrument_id"],
+                "Araç": row["instrument_name"],
+                "Tür": inst_type,
+                "Sağlayıcı": row["provider_name"],
+                "Gross Getiri (%)": row["gross_yield"],
+                "Net Getiri (%)": net_yield,
+                "Beklenen Net TL Katkı": net_contribution,
+                "Likidite Skoru": float(row["base_liquidity_score"]),
+                "Operasyonel Sürtünme": float(row["base_operational_friction"]),
+                "Quote Teyitli": bool(row["quote_confirmed"]),
+                "Nedenler": " | ".join(reasons),
+                "Notlar": row["notes"] or row.get("notes_q", "") or row.get("source", ""),
+                "Cutoff": cutoff or "-",
+                "Source": row.get("source", ""),
+            }
+        )
 
-    eligible_df = pd.DataFrame(rows)
+    eligible_df = pd.DataFrame(eligible_rows)
     rejected_df = pd.DataFrame(rejected_rows)
 
     if not eligible_df.empty:
@@ -476,15 +707,15 @@ def score_candidates(
         eligible_df["Uygulanabilirlik Skoru"] = 100 - eligible_df["Operasyonel Sürtünme"].clip(lower=0, upper=100)
         eligible_df["Likidite Normalized"] = eligible_df["Likidite Skoru"].clip(lower=0, upper=100)
 
-        fit_bonus = []
+        fit_scores = []
         for _, row in eligible_df.iterrows():
-            bonus = 80
-            if planning_mode == "Bugün park et" and row["Cutoff"] and evaluation_dt.time() <= datetime.strptime(str(row["Cutoff"]), "%H:%M").time():
-                bonus += 10
-            if "Bugün içinde uygulanabilir." in row["Nedenler"]:
-                bonus += 5
-            fit_bonus.append(min(bonus, 100))
-        eligible_df["Uygunluk Skoru"] = fit_bonus
+            score = 80
+            if row["Quote Teyitli"]:
+                score += 10
+            if "Bugün içinde uygulanabilir" in row["Nedenler"]:
+                score += 5
+            fit_scores.append(min(score, 100))
+        eligible_df["Uygunluk Skoru"] = fit_scores
         eligible_df["Toplam Skor"] = (
             0.35 * eligible_df["Getiri Skoru"]
             + 0.30 * eligible_df["Uygulanabilirlik Skoru"]
@@ -498,79 +729,91 @@ def score_candidates(
     return eligible_df, rejected_df
 
 
-# ---------- UI state ----------
-if "instruments_df" not in st.session_state:
-    st.session_state.instruments_df = None
-if "quotes_df" not in st.session_state:
-    st.session_state.quotes_df = None
-if "rules_df" not in st.session_state:
-    st.session_state.rules_df = None
+# ---------- session state ----------
+def init_state():
+    if "instruments_df" not in st.session_state:
+        st.session_state["instruments_df"] = load_default_csv("instruments_master.csv")
+    if "quotes_df" not in st.session_state:
+        st.session_state["quotes_df"] = load_default_csv("market_quotes.csv")
+    if "rules_df" not in st.session_state:
+        st.session_state["rules_df"] = load_default_csv("portfolio_rules.csv")
+    if "benchmarks" not in st.session_state:
+        st.session_state["benchmarks"] = {}
+
+
+# ---------- UI ----------
+init_state()
 
 st.title("💸 Nakit Park Motoru")
-st.caption("MVP v2 • karar motoru + hızlı quote girişi + TEFAS otomatik çekim")
+st.caption("Repo / TPP / PPF / KVBAF / Mevduat / Katılım için iç kullanım karar destek MVP'si")
 
 with st.sidebar:
     st.subheader("Veri Kaynağı")
-    st.write("Örnek CSV kullanabilir veya kendi dosyalarını yükleyebilirsin.")
+    st.write("İstersen örnek veriyle devam et, istersen kendi CSV'lerini yükleyip oturumu o veriyle başlat.")
     uploaded_instruments = st.file_uploader("instruments_master.csv", type=["csv"])
     uploaded_quotes = st.file_uploader("market_quotes.csv", type=["csv"])
     uploaded_rules = st.file_uploader("portfolio_rules.csv", type=["csv"])
-    if st.button("Yüklenen dosyaları uygula", use_container_width=True):
-        st.session_state.instruments_df = load_csv_or_default(uploaded_instruments, "instruments_master.csv")
-        st.session_state.quotes_df = load_csv_or_default(uploaded_quotes, "market_quotes.csv")
-        st.session_state.rules_df = load_csv_or_default(uploaded_rules, "portfolio_rules.csv")
-        st.success("Dosyalar uygulandı.")
 
-if st.session_state.instruments_df is None:
-    st.session_state.instruments_df = load_csv_or_default(uploaded_instruments, "instruments_master.csv")
-if st.session_state.quotes_df is None:
-    st.session_state.quotes_df = load_csv_or_default(uploaded_quotes, "market_quotes.csv")
-if st.session_state.rules_df is None:
-    st.session_state.rules_df = load_csv_or_default(uploaded_rules, "portfolio_rules.csv")
+    if st.button("Yüklenen dosyaları oturuma uygula", use_container_width=True):
+        st.session_state["instruments_df"] = load_csv_or_default(uploaded_instruments, "instruments_master.csv")
+        st.session_state["quotes_df"] = load_csv_or_default(uploaded_quotes, "market_quotes.csv")
+        st.session_state["rules_df"] = load_csv_or_default(uploaded_rules, "portfolio_rules.csv")
+        st.success("Yüklü dosyalar oturuma alındı.")
+
+    if st.button("Varsayılan örnek veriye dön", use_container_width=True):
+        st.session_state["instruments_df"] = load_default_csv("instruments_master.csv")
+        st.session_state["quotes_df"] = load_default_csv("market_quotes.csv")
+        st.session_state["rules_df"] = load_default_csv("portfolio_rules.csv")
+        st.success("Varsayılan örnek veri yüklendi.")
 
 instruments, quotes, rules = clean_data(
-    st.session_state.instruments_df,
-    st.session_state.quotes_df,
-    st.session_state.rules_df,
+    st.session_state["instruments_df"],
+    st.session_state["quotes_df"],
+    st.session_state["rules_df"],
 )
-st.session_state.instruments_df = instruments
-st.session_state.quotes_df = quotes
-st.session_state.rules_df = rules
+st.session_state["instruments_df"] = instruments
+st.session_state["quotes_df"] = quotes
+st.session_state["rules_df"] = rules
 
 
-tab1, tab2, tab3, tab4 = st.tabs(["Karar Motoru", "Hızlı Quote Girişi", "TEFAS Otomatik Çek", "Veri Yönetimi"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Karar Motoru",
+    "Otomatik Güncelle",
+    "Quote Yönetimi",
+    "Veri / Kurulum",
+])
 
 with tab1:
     st.markdown("### Talep Girişi")
-    col1, col2, col3, col4 = st.columns(4)
     portfolio_options = rules[["portfolio_id", "portfolio_name"]].drop_duplicates()
-    default_idx = int(portfolio_options.index[portfolio_options["portfolio_id"] == "LIKIT_FON"][0]) if "LIKIT_FON" in portfolio_options["portfolio_id"].values else 0
+    default_portfolio_idx = int(portfolio_options.index[portfolio_options["portfolio_id"] == "LIKIT_FON"][0]) if "LIKIT_FON" in portfolio_options["portfolio_id"].values else 0
 
-    with col1:
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
         portfolio_id = st.selectbox(
             "Fon / kural seti",
             options=portfolio_options["portfolio_id"].tolist(),
-            index=default_idx,
+            index=default_portfolio_idx,
             format_func=lambda x: f"{x} — {portfolio_options.loc[portfolio_options['portfolio_id'] == x, 'portfolio_name'].iloc[0]}",
         )
         amount = st.number_input("Boş nakit (TL)", min_value=1000.0, value=25000000.0, step=1000000.0, format="%.0f")
-    with col2:
+    with c2:
         horizon_days = st.number_input("Park süresi (gün)", min_value=1, max_value=180, value=1, step=1)
         planning_mode = st.selectbox("Başlangıç modu", ["Bugün park et", "Yarın başlat"])
-    with col3:
+    with c3:
         liquidity_need = st.selectbox("Likidite ihtiyacı", ["T+0", "T+1", "Esnek"])
         participation_pref = st.selectbox("Katılım filtresi", ["Hepsi", "Sadece katılım", "Katılım hariç"])
-    with col4:
+    with c4:
         government_pref = st.selectbox("Kamu filtresi", ["Hepsi", "Sadece kamu benzeri"])
         min_rating_user = st.selectbox("Minimum rating", ["NR", "BBB", "A", "AA", "AAA"], index=2)
 
     st.markdown("### Değerlendirme Zamanı")
-    now_ist = datetime.now(IST).replace(tzinfo=None)
-    cdt1, cdt2 = st.columns(2)
-    with cdt1:
-        eval_date = st.date_input("Tarih", value=now_ist.date())
-    with cdt2:
-        eval_time = st.time_input("Saat", value=now_ist.time().replace(second=0, microsecond=0))
+    current = now_ist()
+    d1, d2 = st.columns(2)
+    with d1:
+        eval_date = st.date_input("Tarih", value=current.date())
+    with d2:
+        eval_time = st.time_input("Saat", value=current.time().replace(second=0, microsecond=0))
     evaluation_dt = datetime.combine(eval_date, eval_time)
 
     eligible_df, rejected_df = score_candidates(
@@ -578,7 +821,7 @@ with tab1:
         quotes=quotes,
         rules=rules,
         portfolio_id=portfolio_id,
-        amount=amount,
+        amount=float(amount),
         horizon_days=int(horizon_days),
         planning_mode=planning_mode,
         liquidity_need=liquidity_need,
@@ -588,9 +831,22 @@ with tab1:
         evaluation_dt=evaluation_dt,
     )
 
+    st.markdown("### Referans Kutusu")
+    latest_q = latest_quotes(quotes)
+    ref_cols = st.columns(4)
+    repo_row = latest_q[latest_q["instrument_id"] == "repo_on"]
+    tpp_row = latest_q[latest_q["instrument_id"] == "tpp_on"]
+    ppf_rows = latest_q.merge(instruments[["instrument_id", "instrument_type"]], on="instrument_id", how="left")
+    ppf_mean = ppf_rows[ppf_rows["instrument_type"] == "PPF"]["net_yield"].mean()
+    kv_mean = ppf_rows[ppf_rows["instrument_type"] == "KVBAF"]["net_yield"].mean()
+    ref_cols[0].metric("Repo referansı", format_pct(repo_row["net_yield"].iloc[0]) if not repo_row.empty else "-")
+    ref_cols[1].metric("TPP referansı", format_pct(tpp_row["net_yield"].iloc[0]) if not tpp_row.empty else "-")
+    ref_cols[2].metric("PPF ort. net", format_pct(ppf_mean) if not pd.isna(ppf_mean) else "-")
+    ref_cols[3].metric("KVBAF ort. net", format_pct(kv_mean) if not pd.isna(kv_mean) else "-")
+
     st.markdown("### Sonuç")
     if eligible_df.empty:
-        st.error("Bu filtrelerle uygun alternatif bulunamadı. Filtreleri gevşet veya veri setini güncelle.")
+        st.error("Bu filtrelerle uygun alternatif bulunamadı. Filtreleri gevşet ya da veri setini güncelle.")
     else:
         top = eligible_df.iloc[0]
         m1, m2, m3, m4 = st.columns(4)
@@ -602,11 +858,12 @@ with tab1:
         st.markdown("#### İlk 3 öneri")
         for _, rec in eligible_df.head(3).iterrows():
             with st.container(border=True):
-                left, right = st.columns([2, 1])
+                left, right = st.columns([2.2, 1])
                 with left:
                     st.markdown(f"**{int(rec['Sıra'])}. {rec['Araç']}**")
-                    st.write(f"Tür: {rec['Tür']} | Sağlayıcı: {rec['Sağlayıcı']}")
+                    st.write(f"Tür: {rec['Tür']}  |  Sağlayıcı: {rec['Sağlayıcı']}")
                     st.write(f"Nedenler: {rec['Nedenler'] or '—'}")
+                    st.caption(f"Kaynak: {rec['Source'] or '-'}")
                     if rec["Notlar"]:
                         st.caption(rec["Notlar"])
                 with right:
@@ -614,151 +871,152 @@ with tab1:
                     st.metric("Net katkı", format_currency(rec["Beklenen Net TL Katkı"]))
                     st.metric("Skor", f"{rec['Toplam Skor']:.1f}")
 
-        st.markdown("#### Sıralı tablo")
-        show_cols = ["Sıra", "Araç", "Tür", "Sağlayıcı", "Net Getiri (%)", "Beklenen Net TL Katkı", "Likidite Skoru", "Toplam Skor", "Nedenler", "Cutoff"]
+        show_cols = [
+            "Sıra", "Araç", "Tür", "Sağlayıcı", "Net Getiri (%)", "Beklenen Net TL Katkı",
+            "Likidite Skoru", "Toplam Skor", "Cutoff", "Source", "Nedenler"
+        ]
         st.dataframe(
             eligible_df[show_cols],
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Beklenen Net TL Katkı": st.column_config.NumberColumn(format="%.0f"),
                 "Net Getiri (%)": st.column_config.NumberColumn(format="%.2f"),
+                "Beklenen Net TL Katkı": st.column_config.NumberColumn(format="%.0f"),
                 "Toplam Skor": st.column_config.NumberColumn(format="%.1f"),
             },
         )
-        st.bar_chart(eligible_df[["Araç", "Toplam Skor"]].set_index("Araç"))
         dataframe_to_csv_download(eligible_df, "oneriler.csv", "Öneri tablosunu indir")
 
     st.markdown("### Elenen alternatifler")
     if rejected_df.empty:
         st.info("Elenen alternatif yok.")
     else:
-        st.dataframe(rejected_df[["Araç", "Tür", "Sağlayıcı", "Blokajlar", "Cutoff"]], use_container_width=True, hide_index=True)
+        st.dataframe(rejected_df, use_container_width=True, hide_index=True)
         dataframe_to_csv_download(rejected_df, "elenenler.csv", "Elenenleri indir")
 
 with tab2:
-    st.markdown("### Hızlı manuel quote girişi")
-    st.write("Repo, TPP, mevduat ve katılım quote'larını burada hızlıca güncelleyebilirsin. Kaydet dediğinde uygulama içindeki veri yenilenir.")
+    st.markdown("### 1) TEFAS fonlarını topluca yenile")
+    tefas_candidates = instruments[instruments["auto_source"].astype(str).str.lower().eq("tefas")][["instrument_name", "external_code"]]
+    if tefas_candidates.empty:
+        st.info("TEFAS otomasyonu için instruments_master.csv içinde auto_source=tefas ve external_code alanları gerekli.")
+    else:
+        st.dataframe(tefas_candidates, hide_index=True, use_container_width=True)
+        if st.button("TEFAS fonlarını yenile", type="primary"):
+            updated_quotes, refreshed, errors = refresh_tefas_quotes(instruments, quotes)
+            st.session_state["quotes_df"] = updated_quotes
+            quotes = updated_quotes
+            if refreshed:
+                st.success(f"{len(refreshed)} fon güncellendi.")
+                st.dataframe(pd.DataFrame(refreshed), use_container_width=True, hide_index=True)
+            if errors:
+                st.warning("Bazı fonlar güncellenemedi:")
+                for err in errors:
+                    st.write(f"- {err}")
 
-    col_a, col_b, col_c = st.columns(3)
-    instrument_options = instruments[["instrument_id", "instrument_name"]].drop_duplicates()
+    st.markdown("### 2) Kamuya açık referansları çek")
+    st.caption("Repo ve TPP tarafında kamuya açık veriden best-effort referans üretir. İşlem yapılabilir oran yerine benchmark olarak düşün.")
+    if st.button("Repo / TPP referansını çek"):
+        updated_quotes, refreshed, errors, benchmarks = refresh_public_reference_quotes(instruments, quotes)
+        st.session_state["quotes_df"] = updated_quotes
+        st.session_state["benchmarks"] = benchmarks
+        quotes = updated_quotes
+        if refreshed:
+            st.success("Referans veriler güncellendi.")
+            st.dataframe(pd.DataFrame(refreshed), use_container_width=True, hide_index=True)
+        if errors:
+            st.warning("Bazı referanslar çekilemedi. Bu durumda manuel override kullan.")
+            for err in errors:
+                st.write(f"- {err}")
 
-    with col_a:
-        selected_instrument = st.selectbox(
-            "Araç",
-            options=instrument_options["instrument_id"].tolist(),
-            format_func=lambda x: f"{x} — {instrument_options.loc[instrument_options['instrument_id'] == x, 'instrument_name'].iloc[0]}",
-            key="quick_quote_instrument",
-        )
-        gross_yield = st.number_input("Brüt getiri (%)", value=41.00, step=0.01, format="%.2f")
-        fee_bps = st.number_input("Fee (bps)", value=0, step=1)
-    with col_b:
-        tax_bps = st.number_input("Tax (bps)", value=0, step=1)
-        quote_confirmed = st.checkbox("Quote teyitli", value=True)
-        capacity_available = st.checkbox("Kapasite uygun", value=True)
-    with col_c:
-        source = st.text_input("Kaynak", value="Dealer Quote")
-        valid_until_time = st.time_input("Geçerlilik saati", value=datetime.now(IST).time().replace(hour=16, minute=30, second=0, microsecond=0))
-        notes = st.text_input("Not", value="")
-
-    if st.button("Quote'u kaydet", type="primary"):
-        now_ist = datetime.now(IST).replace(tzinfo=None, second=0, microsecond=0)
-        fee_pct = fee_bps / 100
-        tax_pct = tax_bps / 100
-        net_yield = round(float(gross_yield) - fee_pct - tax_pct, 2)
-        valid_until = datetime.combine(now_ist.date(), valid_until_time)
-        new_quote = {
-            "instrument_id": selected_instrument,
-            "quote_timestamp": now_ist,
-            "quote_valid_until": valid_until,
-            "gross_yield": gross_yield,
-            "fee_bps": fee_bps,
-            "tax_bps": tax_bps,
-            "net_yield": net_yield,
-            "quote_confirmed": quote_confirmed,
-            "capacity_available": capacity_available,
-            "source": source,
-            "notes": notes,
-        }
-        st.session_state.quotes_df = upsert_quote(st.session_state.quotes_df, new_quote)
-        st.success(f"{selected_instrument} güncellendi. Net getiri %{net_yield:.2f}")
-        st.rerun()
-
-    st.markdown("### Toplu düzenleme")
-    editable_quotes = st.data_editor(
-        st.session_state.quotes_df,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        key="quotes_editor",
-    )
-    if st.button("Toplu düzenlemeyi uygula"):
-        st.session_state.quotes_df = editable_quotes
-        st.success("Quote tablosu güncellendi.")
-        st.rerun()
-
-    dataframe_to_csv_download(st.session_state.quotes_df, "market_quotes.csv", "Güncel quote CSV indir")
+    st.markdown("### 3) Tek fon çekme")
+    with st.form("single_tefas_form"):
+        tefas_code = st.text_input("Fon kodu", value="AC4")
+        single_submit = st.form_submit_button("Fon bilgisini çek")
+    if single_submit:
+        try:
+            info = fetch_tefas_fund(tefas_code)
+            st.success("Fon verisi çekildi.")
+            st.json(info)
+        except Exception as e:
+            st.error(f"Fon verisi çekilemedi: {e}")
 
 with tab3:
-    st.markdown("### TEFAS'tan otomatik çek")
-    st.write("Fon kodlarını gir. Sistem TEFAS sayfasından günlük getiri, son 1 ay getirisi, cutoff ve valör bilgilerini çekip taşıma proxy'si üretir.")
+    st.markdown("### Manuel quote girişi")
+    manual_instruments = instruments[instruments["instrument_type"].isin(["Repo", "TPP", "Mevduat", "Katılım"])]
+    with st.form("manual_quote_form"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            selected_instrument = st.selectbox(
+                "Araç",
+                options=manual_instruments["instrument_id"].tolist(),
+                format_func=lambda x: f"{x} — {manual_instruments.loc[manual_instruments['instrument_id']==x, 'instrument_name'].iloc[0]}",
+            )
+            gross_yield = st.number_input("Brüt oran (%)", min_value=0.0, max_value=1000.0, value=42.0, step=0.05)
+            fee_bps = st.number_input("Fee (bps)", min_value=0.0, max_value=500.0, value=0.0, step=1.0)
+        with col2:
+            tax_bps = st.number_input("Tax (bps)", min_value=0.0, max_value=500.0, value=0.0, step=1.0)
+            source = st.text_input("Kaynak", value="Dealer Quote")
+            quote_confirmed = st.checkbox("Quote teyitli", value=True)
+        with col3:
+            capacity_available = st.checkbox("Kapasite uygun", value=True)
+            notes = st.text_area("Not", value="")
+        manual_submit = st.form_submit_button("Quote'u kaydet", type="primary")
 
-    fund_codes = st.text_input("Fon kodları", value="AC4", help="Virgülle ayır: AC4, TI1, PPN")
+    if manual_submit:
+        updated_quotes = add_manual_quote(
+            quotes, instruments, selected_instrument, gross_yield, fee_bps, tax_bps, source, notes, quote_confirmed, capacity_available
+        )
+        st.session_state["quotes_df"] = updated_quotes
+        quotes = updated_quotes
+        st.success("Quote güncellendi.")
 
-    if st.button("TEFAS verisini çek"):
-        codes = [c.strip().upper() for c in fund_codes.split(",") if c.strip()]
-        if not codes:
-            st.warning("En az bir fon kodu gir.")
-        else:
-            fetched_rows = []
-            errors = []
-            for code in codes:
-                try:
-                    fetched_rows.append(fetch_tefas_fund(code))
-                except Exception as exc:
-                    errors.append(f"{code}: {exc}")
-
-            if fetched_rows:
-                fetched_df = pd.DataFrame(fetched_rows)
-                st.dataframe(fetched_df, use_container_width=True, hide_index=True)
-                st.session_state["tefas_last_df"] = fetched_df
-            if errors:
-                for err in errors:
-                    st.error(err)
-
-    tefas_last_df = st.session_state.get("tefas_last_df")
-    if tefas_last_df is not None and not tefas_last_df.empty:
-        st.markdown("### Uygulamaya işle")
-        selected_code = st.selectbox("İşlenecek fon", options=tefas_last_df["fund_code"].tolist())
-        if st.button("Seçili fonu veri setine ekle/güncelle"):
-            fund_data = tefas_last_df.loc[tefas_last_df["fund_code"] == selected_code].iloc[0].to_dict()
-            new_inst, new_quotes, action_text = apply_tefas_to_data(st.session_state.instruments_df, st.session_state.quotes_df, fund_data)
-            st.session_state.instruments_df = new_inst
-            st.session_state.quotes_df = new_quotes
-            st.success(action_text)
-            st.rerun()
+    st.markdown("### Güncel quote tablosu")
+    latest_q = latest_quotes(quotes).merge(
+        instruments[["instrument_id", "instrument_name", "instrument_type", "provider_name"]], on="instrument_id", how="left"
+    )
+    st.dataframe(
+        latest_q[[
+            "instrument_name", "instrument_type", "provider_name", "gross_yield", "net_yield",
+            "quote_timestamp", "quote_valid_until", "quote_confirmed", "source", "notes"
+        ]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    dataframe_to_csv_download(quotes, "market_quotes.csv", "Güncel market_quotes.csv indir")
 
 with tab4:
-    st.markdown("### Aktif veri setleri")
+    st.markdown("### Veri dosyaları")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("**instruments_master.csv**")
-        st.dataframe(st.session_state.instruments_df, use_container_width=True, hide_index=True)
-        dataframe_to_csv_download(st.session_state.instruments_df, "instruments_master.csv", "Instrument CSV indir")
+        st.dataframe(instruments, use_container_width=True, hide_index=True)
+        dataframe_to_csv_download(instruments, "instruments_master.csv", "instruments_master.csv indir")
     with c2:
         st.markdown("**market_quotes.csv**")
-        st.dataframe(st.session_state.quotes_df, use_container_width=True, hide_index=True)
-        dataframe_to_csv_download(st.session_state.quotes_df, "market_quotes.csv", "Quote CSV indir")
+        st.dataframe(quotes, use_container_width=True, hide_index=True)
+        dataframe_to_csv_download(quotes, "market_quotes.csv", "market_quotes.csv indir")
     with c3:
         st.markdown("**portfolio_rules.csv**")
-        st.dataframe(st.session_state.rules_df, use_container_width=True, hide_index=True)
-        dataframe_to_csv_download(st.session_state.rules_df, "portfolio_rules.csv", "Rules CSV indir")
+        st.dataframe(rules, use_container_width=True, hide_index=True)
+        dataframe_to_csv_download(rules, "portfolio_rules.csv", "portfolio_rules.csv indir")
 
-    st.markdown("### Bugün nasıl kullanacaksın?")
+    st.markdown("### Senin bugün yapacağın şey")
     st.write(
-        "1) Repo ve TPP için dealer/ForInvest oranını Hızlı Quote Girişi sekmesinden gir. "
-        "2) PPF/KVBAF için TEFAS kodunu yazıp otomatik çek. "
-        "3) Mevduat/katılım teklifini yine Hızlı Quote Girişi'nden işle. "
-        "4) Karar Motoru sekmesinde sonucu al."
+        "1) Bu yeni app.py, requirements.txt ve data klasörünü GitHub repo'na yükle. "
+        "2) Streamlit Cloud otomatik yeniden build edecek. "
+        "3) App açılınca önce Otomatik Güncelle sekmesinde TEFAS fonlarını yenile. "
+        "4) Repo/TPP referansı çek. "
+        "5) Mevduat ve katılım için yalnızca gelen gerçek banka quote'unu Manuel Quote sekmesinden gir. "
+        "6) İstersen güncel CSV'leri indirip GitHub'a geri koy; böylece son veri repo'da kalıcı olur."
     )
-    st.info("Not: Streamlit Community Cloud kalıcı veritabanı değildir. Uygulama içindeki güncellemeleri kaybetmemek için CSV'leri indirip GitHub repo'na geri yükle.")
+
+    st.markdown("### Önemli notlar")
+    st.markdown(
+        """
+        - TEFAS tarafı otomatik.
+        - Repo ve TPP tarafında kamuya açık referans çekimi **best-effort** çalışır; kesin executable quote değildir.
+        - Mevduat ve katılım oranı manuel kalır; çünkü gerçek banka quote'u gerekir.
+        - Streamlit Cloud kalıcı veritabanı değildir; bu yüzden istersen güncel CSV'leri indirip GitHub'a yükle.
+        """
+    )
+
