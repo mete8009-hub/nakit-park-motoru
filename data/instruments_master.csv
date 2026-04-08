@@ -1,0 +1,8 @@
+instrument_id,instrument_name,instrument_type,provider_name,issuer_type,rating,min_amount,max_amount,max_horizon_days,quote_required,supports_same_day,supports_forward_value,participation_flag,government_only_flag,base_liquidity_score,base_operational_friction,same_day_cutoff,active_flag,external_code,notes
+repo_on,BIST Repo O/N,Repo,BIST Repo Piyasası,Government,AAA,1000000,500000000,7,False,True,True,False,True,90,15,17:15,True,,Kısa vadeli nakit park için yüksek likidite.
+tpp_on,Takasbank Para Piyasası O/N,TPP,Takasbank,Market,AAA,100000,250000000,30,False,True,True,False,False,85,20,15:30,True,,Likidite ve uygulanabilirlik açısından güçlü kısa vade alternatifi.
+ppf_alpha,Alpha Para Piyasası Fonu,PPF,Alpha PYŞ,Fund,AA,1000,500000000,30,False,True,True,False,False,78,10,13:30,True,AC4,"Operasyonel kolaylığı yüksek, TEFAS penceresine duyarlı."
+ppf_beta,Beta Para Piyasası Fonu,PPF,Beta PYŞ,Fund,AA,1000,500000000,30,False,True,True,False,False,76,10,13:30,True,TI1,Para piyasası fonu alternatifi.
+kvbaf_delta,Delta Kısa Vadeli Borçlanma Araçları Fonu,KVBAF,Delta PYŞ,Fund,A,1000,250000000,90,False,False,True,False,False,62,18,12:30,True,AAV,Biraz daha uzun parkta anlamlı olabilir.
+mevduat_bank_a,Bank A O/N Mevduat,Mevduat,Bank A,Bank,AA,5000000,200000000,30,True,True,True,False,False,68,25,16:30,True,,Quote ve karşı taraf limiti kritik.
+katilim_bank_b,Bank B Gecelik Katılım,Katılım,Bank B,Bank,AA,3000000,150000000,30,True,True,True,True,False,65,25,16:00,True,,Katılım tarafı için manuel quote gerektirir.
