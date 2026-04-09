@@ -14,6 +14,18 @@ from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="Nakit Park Motoru", page_icon="💸", layout="wide")
 
+st.markdown("""
+<style>
+.block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+.metric-card {border: 1px solid rgba(250,250,250,0.08); border-radius: 14px; padding: 0.9rem 1rem; background: rgba(255,255,255,0.02);}
+.small-label {font-size: 0.85rem; color: #9ca3af; margin-bottom: 0.15rem;}
+.big-value {font-size: 1.55rem; font-weight: 700; line-height: 1.1;}
+.status-ok {color: #22c55e; font-weight: 600;}
+.status-warn {color: #f59e0b; font-weight: 600;}
+.status-bad {color: #ef4444; font-weight: 600;}
+</style>
+""", unsafe_allow_html=True)
+
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 IST = ZoneInfo("Europe/Istanbul")
@@ -133,6 +145,21 @@ def format_pct(x: float) -> str:
     return f"%{x:.2f}"
 
 
+def format_dt_tr(value) -> str:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return "-"
+    return ts.strftime("%d.%m.%Y %H:%M")
+
+
+def render_metric_card(label: str, value: str, help_text: str | None = None):
+    help_html = f'<div class="small-label">{help_text}</div>' if help_text else ''
+    st.markdown(
+        f'<div class="metric-card"><div class="small-label">{label}</div><div class="big-value">{value}</div>{help_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def dataframe_to_csv_download(df: pd.DataFrame, filename: str, label: str):
     csv = df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
@@ -153,6 +180,25 @@ def fetch_google_quotes_csv(csv_url: str) -> pd.DataFrame:
     return pd.read_csv(csv_url)
 
 
+def parse_google_rate(value, source: str = "") -> float | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    s = str(value).strip().replace("%", "").replace(" ", "")
+    if not s:
+        return None
+    # Decimal comma support
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")
+    try:
+        n = float(s)
+    except Exception:
+        return None
+    # DDE bridge sometimes sends 4000 for 40.00 or 4155 for 41.55
+    if "ForInvest DDE" in str(source) and abs(n) >= 100:
+        n = n / 100.0
+    return round(n, 2)
+
+
 def _normalize_sheet_quotes(sheet_quotes: pd.DataFrame) -> pd.DataFrame:
     sheet_quotes = sheet_quotes.copy()
     needed = ["instrument_id", "instrument_name", "gross_yield", "net_yield", "quote_timestamp", "source", "notes"]
@@ -161,8 +207,8 @@ def _normalize_sheet_quotes(sheet_quotes: pd.DataFrame) -> pd.DataFrame:
             sheet_quotes[col] = ""
     sheet_quotes = sheet_quotes[needed]
     sheet_quotes["instrument_id"] = sheet_quotes["instrument_id"].astype(str).str.strip()
-    sheet_quotes["gross_yield"] = pd.to_numeric(sheet_quotes["gross_yield"], errors="coerce")
-    sheet_quotes["net_yield"] = pd.to_numeric(sheet_quotes["net_yield"], errors="coerce")
+    sheet_quotes["gross_yield"] = [parse_google_rate(v, s) for v, s in zip(sheet_quotes["gross_yield"], sheet_quotes["source"])]
+    sheet_quotes["net_yield"] = [parse_google_rate(v, s) for v, s in zip(sheet_quotes["net_yield"], sheet_quotes["source"])]
     sheet_quotes["quote_timestamp"] = pd.to_datetime(sheet_quotes["quote_timestamp"], errors="coerce", dayfirst=True)
     return sheet_quotes.dropna(subset=["instrument_id"])
 
@@ -793,6 +839,39 @@ def score_candidates(
     return eligible_df, rejected_df
 
 
+
+
+# ---------- quote monitoring ----------
+def quote_stale_minutes(inst_type: str) -> int:
+    return {"Repo": 30, "TPP": 30, "PPF": 24 * 60, "KVBAF": 24 * 60, "Mevduat": 6 * 60, "Katılım": 6 * 60}.get(inst_type, 6 * 60)
+
+
+def build_quote_monitor(quotes: pd.DataFrame, instruments: pd.DataFrame) -> pd.DataFrame:
+    latest_q = latest_quotes(quotes).merge(
+        instruments[["instrument_id", "instrument_name", "instrument_type", "provider_name"]],
+        on="instrument_id", how="left"
+    )
+    if latest_q.empty:
+        return latest_q
+    now = now_ist()
+    latest_q["quote_timestamp"] = pd.to_datetime(latest_q["quote_timestamp"], errors="coerce")
+    latest_q["quote_valid_until"] = pd.to_datetime(latest_q["quote_valid_until"], errors="coerce")
+    latest_q["age_min"] = (pd.Timestamp(now) - latest_q["quote_timestamp"]).dt.total_seconds().div(60)
+    latest_q["allowed_age_min"] = latest_q["instrument_type"].map(quote_stale_minutes)
+    latest_q["expired_cutoff"] = latest_q["quote_valid_until"].notna() & (latest_q["quote_valid_until"] < pd.Timestamp(now))
+    latest_q["stale"] = latest_q["age_min"].fillna(10**9) > latest_q["allowed_age_min"]
+    latest_q["durum"] = np.where(latest_q["expired_cutoff"], "Cutoff geçti", np.where(latest_q["stale"], "Eski", "Güncel"))
+    latest_q["status_icon"] = latest_q["durum"].map({"Güncel": "🟢", "Eski": "🟠", "Cutoff geçti": "🔴"}).fillna("⚪")
+    latest_q["last_refresh_label"] = latest_q["quote_timestamp"].apply(format_dt_tr)
+    return latest_q.sort_values(["instrument_type", "instrument_name"]).reset_index(drop=True)
+
+
+def get_repo_tpp_summary(monitor_df: pd.DataFrame) -> tuple[dict, dict]:
+    def pick(iid: str) -> dict:
+        rows = monitor_df[monitor_df["instrument_id"] == iid]
+        return rows.iloc[0].to_dict() if not rows.empty else {}
+    return pick("repo_on"), pick("tpp_on")
+
 # ---------- session state ----------
 def init_state():
     if "instruments_df" not in st.session_state:
@@ -816,11 +895,11 @@ def init_state():
 init_state()
 
 st.title("💸 Nakit Park Motoru")
-st.caption("Repo / TPP / PPF / KVBAF / Mevduat / Katılım için iç kullanım karar destek MVP'si")
+st.caption("Kısa park kararında repo, TPP ve seçili fonları tek ekranda karşılaştıran iç kullanım karar destek ekranı")
 
 with st.sidebar:
     st.subheader("Veri Kaynağı")
-    st.caption("Repo ve TPP quote'ları Google Sheets içindeki canlı köprüden okunur. Instruments ve rules dosyaları yine repo içindeki CSV'lerden gelir.")
+    st.caption("Repo ve TPP quote'ları Google Sheets köprüsünden, fon tarafı TEFAS ve repo içi veri dosyalarından gelir.")
     st.info(st.session_state.get("quotes_source_status", "-"))
 
     uploaded_instruments = st.file_uploader("instruments_master.csv", type=["csv"])
@@ -828,6 +907,7 @@ with st.sidebar:
 
     if st.button("Google Sheets quote'larını şimdi yenile", use_container_width=True):
         try:
+            fetch_google_quotes_csv.clear()
             sheet_quotes = fetch_google_quotes_csv(GOOGLE_QUOTES_CSV_URL)
             base_quotes = load_default_csv("market_quotes.csv")
             st.session_state["quotes_df"] = merge_google_quotes(base_quotes, sheet_quotes, st.session_state["instruments_df"])
@@ -840,6 +920,7 @@ with st.sidebar:
         st.session_state["instruments_df"] = load_csv_or_default(uploaded_instruments, "instruments_master.csv")
         st.session_state["rules_df"] = load_csv_or_default(uploaded_rules, "portfolio_rules.csv")
         try:
+            fetch_google_quotes_csv.clear()
             sheet_quotes = fetch_google_quotes_csv(GOOGLE_QUOTES_CSV_URL)
             base_quotes = load_default_csv("market_quotes.csv")
             st.session_state["quotes_df"] = merge_google_quotes(base_quotes, sheet_quotes, st.session_state["instruments_df"])
@@ -853,6 +934,7 @@ with st.sidebar:
         st.session_state["instruments_df"] = load_default_csv("instruments_master.csv")
         st.session_state["rules_df"] = load_default_csv("portfolio_rules.csv")
         try:
+            fetch_google_quotes_csv.clear()
             sheet_quotes = fetch_google_quotes_csv(GOOGLE_QUOTES_CSV_URL)
             st.session_state["quotes_df"] = merge_google_quotes(load_default_csv("market_quotes.csv"), sheet_quotes, st.session_state["instruments_df"])
             st.session_state["quotes_source_status"] = "Google Sheets canlı veri kullanılıyor."
@@ -870,13 +952,69 @@ st.session_state["instruments_df"] = instruments
 st.session_state["quotes_df"] = quotes
 st.session_state["rules_df"] = rules
 
+monitor_df = build_quote_monitor(quotes, instruments)
+repo_summary, tpp_summary = get_repo_tpp_summary(monitor_df)
+last_live_ts = monitor_df["quote_timestamp"].max() if not monitor_df.empty else pd.NaT
+last_live_label = format_dt_tr(last_live_ts)
+stale_repo_tpp = monitor_df[monitor_df["instrument_id"].isin(["repo_on", "tpp_on"]) & (monitor_df["durum"] != "Güncel")]
 
-tab1, tab2, tab3, tab4 = st.tabs([
+with st.sidebar:
+    st.markdown("---")
+    st.caption(f"Son güncelleme: **{last_live_label}**")
+    if stale_repo_tpp.empty:
+        st.success("Repo ve TPP quote'ları güncel görünüyor.")
+    else:
+        stale_names = ", ".join(stale_repo_tpp["instrument_name"].tolist())
+        st.warning(f"Stale/expired quote uyarısı: {stale_names}")
+
+summary_cols = st.columns(4)
+with summary_cols[0]:
+    render_metric_card("Repo O/N", format_pct(repo_summary.get("net_yield", np.nan)), repo_summary.get("durum", "-"))
+with summary_cols[1]:
+    render_metric_card("TPP O/N", format_pct(tpp_summary.get("net_yield", np.nan)), tpp_summary.get("durum", "-"))
+with summary_cols[2]:
+    render_metric_card("Son güncelleme", last_live_label, "Canlı quote zamanı")
+with summary_cols[3]:
+    fresh_count = int((monitor_df["durum"] == "Güncel").sum()) if not monitor_df.empty else 0
+    total_count = int(len(monitor_df)) if not monitor_df.empty else 0
+    render_metric_card("Güncel quote oranı", f"{fresh_count}/{total_count}", "Quote sağlığı")
+
+if not stale_repo_tpp.empty:
+    st.warning("Repo veya TPP quote'larından en az biri eski ya da cutoff sonrası durumda. Karar vermeden önce quote yenile." )
+
+tab0, tab1, tab2, tab3, tab4 = st.tabs([
+    "PM Görünümü",
     "Karar Motoru",
     "Otomatik Güncelle",
     "Quote Yönetimi",
     "Veri / Kurulum",
 ])
+
+with tab0:
+    st.markdown("### Portföy Yöneticisi Özeti")
+    pm_cols = st.columns([1.1, 1.1, 1.4])
+    with pm_cols[0]:
+        st.markdown("#### Kısa park çekirdek alternatifleri")
+        core_view = monitor_df[monitor_df["instrument_id"].isin(["repo_on", "tpp_on"])][["status_icon", "instrument_name", "net_yield", "durum", "last_refresh_label", "source"]].copy()
+        if core_view.empty:
+            st.info("Repo/TPP canlı quote bulunamadı.")
+        else:
+            core_view = core_view.rename(columns={"status_icon": "Durum", "instrument_name": "Araç", "net_yield": "Net Getiri", "last_refresh_label": "Son Güncelleme", "source": "Kaynak"})
+            st.dataframe(core_view, use_container_width=True, hide_index=True, column_config={"Net Getiri": st.column_config.NumberColumn(format="%.2f")})
+    with pm_cols[1]:
+        st.markdown("#### En güçlü PPF adayları")
+        ppf_view = monitor_df[monitor_df["instrument_type"] == "PPF"].sort_values("net_yield", ascending=False).head(5)[["instrument_name", "net_yield", "last_refresh_label"]]
+        if ppf_view.empty:
+            st.info("PPF quote'u yok.")
+        else:
+            ppf_view = ppf_view.rename(columns={"instrument_name": "Fon", "net_yield": "Net Getiri", "last_refresh_label": "Son Güncelleme"})
+            st.dataframe(ppf_view, use_container_width=True, hide_index=True, column_config={"Net Getiri": st.column_config.NumberColumn(format="%.2f")})
+    with pm_cols[2]:
+        st.markdown("#### Kullanım notu")
+        st.write("1. Önce canlı quote'ları Google Sheets'ten yenileyin.")
+        st.write("2. Karar Motoru sekmesinde tutar, gün ve likidite ihtiyacını seçin.")
+        st.write("3. Sistem, repo/TPP ve seçili fonları aynı çerçevede sıralasın.")
+        st.info("Bu ekran tavsiye motoru değil; ilk filtreleme ve hızlı kıyaslama ekranıdır.")
 
 with tab1:
     st.markdown("### Talep Girişi")
@@ -928,7 +1066,7 @@ with tab1:
 
     st.markdown("### Referans Kutusu")
     latest_q = latest_quotes(quotes)
-    ref_cols = st.columns(4)
+    ref_cols = st.columns(5)
     repo_row = latest_q[latest_q["instrument_id"] == "repo_on"]
     tpp_row = latest_q[latest_q["instrument_id"] == "tpp_on"]
     ppf_rows = latest_q.merge(instruments[["instrument_id", "instrument_type"]], on="instrument_id", how="left")
@@ -938,6 +1076,7 @@ with tab1:
     ref_cols[1].metric("TPP referansı", format_pct(tpp_row["net_yield"].iloc[0]) if not tpp_row.empty else "-")
     ref_cols[2].metric("PPF ort. net", format_pct(ppf_mean) if not pd.isna(ppf_mean) else "-")
     ref_cols[3].metric("KVBAF ort. net", format_pct(kv_mean) if not pd.isna(kv_mean) else "-")
+    ref_cols[4].metric("Canlı quote zamanı", last_live_label)
 
     st.markdown("### Sonuç")
     if eligible_df.empty:
@@ -1066,16 +1205,21 @@ with tab3:
         st.success("Quote güncellendi.")
 
     st.markdown("### Güncel quote tablosu")
-    latest_q = latest_quotes(quotes).merge(
-        instruments[["instrument_id", "instrument_name", "instrument_type", "provider_name"]], on="instrument_id", how="left"
-    )
+    latest_q = build_quote_monitor(quotes, instruments)
+    display_q = latest_q[[
+        "status_icon", "durum", "instrument_name", "instrument_type", "provider_name", "gross_yield", "net_yield",
+        "quote_timestamp", "quote_valid_until", "quote_confirmed", "source", "notes"
+    ]].rename(columns={"status_icon": "Durum İkonu", "durum": "Durum"})
     st.dataframe(
-        latest_q[[
-            "instrument_name", "instrument_type", "provider_name", "gross_yield", "net_yield",
-            "quote_timestamp", "quote_valid_until", "quote_confirmed", "source", "notes"
-        ]],
+        display_q,
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "gross_yield": st.column_config.NumberColumn("Brüt Getiri", format="%.2f"),
+            "net_yield": st.column_config.NumberColumn("Net Getiri", format="%.2f"),
+            "quote_timestamp": st.column_config.DatetimeColumn("Quote Zamanı", format="DD.MM.YYYY HH:mm"),
+            "quote_valid_until": st.column_config.DatetimeColumn("Geçerlilik", format="DD.MM.YYYY HH:mm"),
+        },
     )
     dataframe_to_csv_download(quotes, "market_quotes.csv", "Güncel market_quotes.csv indir")
 
