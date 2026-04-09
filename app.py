@@ -21,13 +21,9 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-HEADERS = {
-    "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-}
+HEADERS = {"User-Agent": USER_AGENT}
+
+GOOGLE_QUOTES_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTJlOPHHr_7KP6NtIV5nXKXc-GWzTqA36I3XgOohTGCmY1ghtxXvS3WABwKJ_RWDm8PVbNFT9xUlUVI/pub?gid=0&single=true&output=csv"
 
 RATING_ORDER = {"NR": 0, "BBB": 1, "A": 2, "AA": 3, "AAA": 4}
 
@@ -152,6 +148,68 @@ def load_csv_or_default(uploaded_file, default_filename: str) -> pd.DataFrame:
     return pd.read_csv(uploaded_file)
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_google_quotes_csv(csv_url: str) -> pd.DataFrame:
+    return pd.read_csv(csv_url)
+
+
+def _normalize_sheet_quotes(sheet_quotes: pd.DataFrame) -> pd.DataFrame:
+    sheet_quotes = sheet_quotes.copy()
+    needed = ["instrument_id", "instrument_name", "gross_yield", "net_yield", "quote_timestamp", "source", "notes"]
+    for col in needed:
+        if col not in sheet_quotes.columns:
+            sheet_quotes[col] = ""
+    sheet_quotes = sheet_quotes[needed]
+    sheet_quotes["instrument_id"] = sheet_quotes["instrument_id"].astype(str).str.strip()
+    sheet_quotes["gross_yield"] = pd.to_numeric(sheet_quotes["gross_yield"], errors="coerce")
+    sheet_quotes["net_yield"] = pd.to_numeric(sheet_quotes["net_yield"], errors="coerce")
+    sheet_quotes["quote_timestamp"] = pd.to_datetime(sheet_quotes["quote_timestamp"], errors="coerce", dayfirst=True)
+    return sheet_quotes.dropna(subset=["instrument_id"])
+
+
+def merge_google_quotes(base_quotes: pd.DataFrame, sheet_quotes: pd.DataFrame, instruments: pd.DataFrame) -> pd.DataFrame:
+    base_quotes = ensure_columns(base_quotes, {
+        "fee_bps": 0, "tax_bps": 0, "quote_confirmed": False, "capacity_available": True,
+        "source": "", "notes": "", "quote_valid_until": pd.NaT, "quote_timestamp": pd.NaT,
+    }).copy()
+    if sheet_quotes.empty:
+        return base_quotes
+
+    norm = _normalize_sheet_quotes(sheet_quotes)
+    if norm.empty:
+        return base_quotes
+
+    inst_map = instruments.set_index("instrument_id") if not instruments.empty else pd.DataFrame()
+    rows = []
+    current_ts = now_ist()
+    for _, row in norm.iterrows():
+        iid = row["instrument_id"]
+        existing = base_quotes[base_quotes["instrument_id"] == iid].sort_values("quote_timestamp").tail(1)
+        out = existing.iloc[0].to_dict() if not existing.empty else {"instrument_id": iid}
+        out["instrument_id"] = iid
+        if not inst_map.empty and iid in inst_map.index:
+            inst = inst_map.loc[iid]
+            out.setdefault("fee_bps", 0)
+            out.setdefault("tax_bps", 0)
+            out.setdefault("capacity_available", True)
+            out.setdefault("quote_confirmed", True)
+            cutoff = str(inst.get("same_day_cutoff", "")).strip()
+            out["quote_valid_until"] = pd.to_datetime(f"{current_ts.date()} {cutoff}", errors="coerce") if cutoff else pd.NaT
+        out["gross_yield"] = row["gross_yield"]
+        out["net_yield"] = row["net_yield"] if pd.notna(row["net_yield"]) else row["gross_yield"]
+        out["quote_timestamp"] = row["quote_timestamp"] if pd.notna(row["quote_timestamp"]) else pd.Timestamp(current_ts)
+        out["source"] = row.get("source", "Google Sheets") or "Google Sheets"
+        out["notes"] = row.get("notes", "")
+        out["quote_confirmed"] = True
+        out["capacity_available"] = True
+        rows.append(out)
+
+    updates_df = pd.DataFrame(rows)
+    rest = base_quotes[~base_quotes["instrument_id"].isin(updates_df["instrument_id"])].copy()
+    merged = pd.concat([rest, updates_df], ignore_index=True, sort=False)
+    return merged
+
+
 def ensure_columns(df: pd.DataFrame, required: dict[str, object]) -> pd.DataFrame:
     df = df.copy()
     for col, default in required.items():
@@ -268,26 +326,12 @@ def clean_data(instruments: pd.DataFrame, quotes: pd.DataFrame, rules: pd.DataFr
 
 
 # ---------- scraping helpers ----------
-def fetch_url_content(url: str, prewarm_url: str | None = None) -> tuple[str, str]:
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    if prewarm_url:
-        try:
-            session.get(prewarm_url, timeout=20)
-        except Exception:
-            pass
-    resp = session.get(url, timeout=20, allow_redirects=True)
+def get_page_text(url: str) -> str:
+    resp = requests.get(url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     resp.encoding = "utf-8"
-    html = resp.text
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    return html, text
-
-
-def get_page_text(url: str) -> str:
-    _, text = fetch_url_content(url)
-    return text
+    soup = BeautifulSoup(resp.text, "html.parser")
+    return soup.get_text("\n", strip=True)
 
 
 def extract_numeric_pct(text: str | None) -> float | None:
@@ -316,79 +360,37 @@ def extract_after_label(text: str, label: str, pattern: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
-def extract_after_any_label(text: str, labels: list[str], pattern: str) -> str | None:
-    for label in labels:
-        val = extract_after_label(text, label, pattern)
-        if val:
-            return val
-    return None
-
-
-def tefas_field(text: str, html: str, labels: list[str], pattern: str) -> str | None:
-    for source in (text, html):
-        val = extract_after_any_label(source, labels, pattern)
-        if val:
-            return val
-    return None
-
-
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_tefas_fund(code: str) -> dict:
     code = code.strip().upper()
     if not code:
         raise ValueError("Fon kodu boş olamaz.")
     url = f"https://www.tefas.gov.tr/FonAnaliz.aspx?FonKod={code}"
-    html, text = fetch_url_content(url, prewarm_url="https://www.tefas.gov.tr/")
+    text = get_page_text(url)
 
-    title_name = None
-    title_match = re.search(r"##\s+([^\n]+)", text)
-    if title_match:
-        title_name = title_match.group(1).strip()
+    name = extract_after_label(text, "Fon Detaylı Analiz", r"([A-ZÇĞİÖŞÜ0-9\-\(\)\.\s]+FON)")
+    category = extract_after_label(text, "Kategorisi", r"([A-Za-zÇĞİÖŞÜçğıöşü\s]+)")
+    daily_return_text = extract_after_label(text, "Günlük Getiri (%)", r"(%?[0-9\.,-]+)")
+    one_month_text = extract_after_label(text, "Son 1 Ay Getirisi", r"(%?[0-9\.,-]+)")
+    start_hour = extract_after_label(text, "İşlem Başlangıç Saati", r"([0-9]{2}:[0-9]{2})")
+    cutoff_hour = extract_after_label(text, "Son İşlem Saati", r"([0-9]{2}:[0-9]{2})")
+    buy_valor = extract_after_label(text, "Fon Alış Valörü", r"([0-9]+)")
+    sell_valor = extract_after_label(text, "Fon Satış Valörü", r"([0-9]+)")
+    max_buy_text = extract_after_label(text, "Max. Alış İşlem Miktarı", r"([0-9\.,]+)")
+    risk_value = extract_after_label(text, "Fonun Risk Değeri", r"([0-9]+)")
 
-    name = title_name or tefas_field(text, html, ["Fon Detaylı Analiz"], r"([^\n]+)")
-    category = tefas_field(text, html, ["Kategorisi"], r"([A-Za-zÇĞİÖŞÜçğıöşü()\-\s]+)")
-    daily_return_text = tefas_field(text, html, ["Günlük Getiri (%)", "Gunluk Getiri (%)"], r"(%?[\-]?[0-9\.,]+)")
-    one_month_text = tefas_field(text, html, ["Son 1 Ay Getirisi"], r"(%?[\-]?[0-9\.,]+)")
-    start_hour = tefas_field(text, html, ["İşlem Başlangıç Saati", "Islem Baslangic Saati"], r"([0-9]{2}:[0-9]{2})")
-    cutoff_hour = tefas_field(text, html, ["Son İşlem Saati", "Son Islem Saati"], r"([0-9]{2}:[0-9]{2})")
-    buy_valor = tefas_field(text, html, ["Fon Alış Valörü", "Fon Alis Valoru"], r"([0-9]+)")
-    sell_valor = tefas_field(text, html, ["Fon Satış Valörü", "Fon Satis Valoru"], r"([0-9]+)")
-    max_buy_text = tefas_field(text, html, ["Max. Alış İşlem Miktarı", "Max. Alis Islem Miktari"], r"([0-9\.,]+)")
-    risk_value = tefas_field(text, html, ["Fonun Risk Değeri", "Fonun Risk Degeri"], r"([0-9]+)")
-
-    daily_return = extract_numeric_pct(daily_return_text)
-    one_month_return = extract_numeric_pct(one_month_text)
+    daily_return = extract_numeric_pct(daily_return_text) or 0.0
+    one_month_return = extract_numeric_pct(one_month_text) or 0.0
     max_buy_amount = extract_numeric_amount(max_buy_text)
-
-    parsed_points = sum(
-        x is not None and str(x).strip() != ""
-        for x in [name, category, daily_return_text, one_month_text, start_hour, cutoff_hour, buy_valor, sell_valor]
-    )
-    if parsed_points < 4:
-        raise RuntimeError(
-            "TEFAS sayfası eksik döndü veya WAF nedeniyle değerler okunamadı. "
-            "Bu fonda otomatik güncelle güvenilir değil; manuel override kullan."
-        )
-
-    daily_return = 0.0 if daily_return is None else daily_return
-    one_month_return = 0.0 if one_month_return is None else one_month_return
 
     annualized_daily = daily_return * 365
     annualized_monthly = one_month_return * 12
-    if daily_return > 0:
-        annualized_proxy = annualized_daily
-    elif one_month_return > 0:
-        annualized_proxy = annualized_monthly
-    else:
-        annualized_proxy = max(annualized_daily, annualized_monthly)
-
-    if annualized_proxy <= 0 and (daily_return == 0 and one_month_return == 0):
-        raise RuntimeError("TEFAS getiri alanları okunamadı; 0 değer ile quote güncellenmedi.")
+    annualized_proxy = annualized_daily if daily_return > 0 else annualized_monthly
 
     return {
         "fund_code": code,
-        "instrument_name": (name or code).strip(),
-        "category": (category or "").strip(),
+        "instrument_name": name or code,
+        "category": category or "",
         "daily_return_pct": round(daily_return, 6),
         "one_month_return_pct": round(one_month_return, 6),
         "annualized_proxy_pct": round(annualized_proxy, 2),
@@ -404,14 +406,11 @@ def fetch_tefas_fund(code: str) -> dict:
 
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_borsa_index_info(index_url: str) -> dict:
-    html, text = fetch_url_content(index_url)
+    text = get_page_text(index_url)
 
     def _extract(label: str):
-        for source in (text, html):
-            m = re.search(rf"{re.escape(label)}\s*([0-9\.,]+)", source, flags=re.IGNORECASE)
-            if m:
-                return extract_numeric_amount(m.group(1))
-        return None
+        m = re.search(rf"{re.escape(label)}\s*([0-9\.,]+)", text, flags=re.IGNORECASE)
+        return extract_numeric_amount(m.group(1)) if m else None
 
     current_val = _extract("Current Value")
     previous_close = _extract("Previous Close")
@@ -429,44 +428,30 @@ def fetch_borsa_index_info(index_url: str) -> dict:
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_tpp_public_reference() -> dict | None:
+def fetch_tpp_public_reference() -> dict:
+    # best-effort parser; page structure may change
     candidates = [
         "https://www.takasbank.com.tr/tr/istatistikler/takasbank-para-piyasasi-tpp/tpp-gunluk-bulten",
         "https://www.takasbank.com.tr/tr/istatistikler/takasbank-para-piyasasi-tpp/tpp-islem-ortalamalari-raporu",
     ]
+    last_error = None
     for url in candidates:
         try:
-            html, text = fetch_url_content(url)
-            searchable = [text, html]
+            text = get_page_text(url)
             patterns = [
-                r"O/?N[^\n]{0,120}?([0-9]{1,2}[\.,][0-9]{1,4})",
-                r"Gecelik[^\n]{0,120}?([0-9]{1,2}[\.,][0-9]{1,4})",
-                r"Ağırlıklı Ortalama Faiz[^\n]{0,120}?([0-9]{1,2}[\.,][0-9]{1,4})",
-                r"ortalama[^\n]{0,120}?faiz[^\n]{0,120}?([0-9]{1,2}[\.,][0-9]{1,4})",
+                r"O/?N[^\n]{0,80}?([0-9]{1,2}[\.,][0-9]{1,4})",
+                r"Gecelik[^\n]{0,80}?([0-9]{1,2}[\.,][0-9]{1,4})",
+                r"Ağırlıklı Ortalama Faiz[^\n]{0,80}?([0-9]{1,2}[\.,][0-9]{1,4})",
             ]
-            for source in searchable:
-                for p in patterns:
-                    m = re.search(p, source, flags=re.IGNORECASE)
-                    if m:
-                        rate = extract_numeric_pct(m.group(1))
-                        if rate is not None:
-                            return {"rate": rate, "url": url, "method": "regex"}
-            try:
-                tables = pd.read_html(html)
-                for tbl in tables:
-                    tbl = tbl.fillna("").astype(str)
-                    joined = " ".join(tbl.stack().tolist())
-                    for p in patterns:
-                        m = re.search(p, joined, flags=re.IGNORECASE)
-                        if m:
-                            rate = extract_numeric_pct(m.group(1))
-                            if rate is not None:
-                                return {"rate": rate, "url": url, "method": "table"}
-            except Exception:
-                pass
-        except Exception:
-            continue
-    return None
+            for p in patterns:
+                m = re.search(p, text, flags=re.IGNORECASE)
+                if m:
+                    rate = extract_numeric_pct(m.group(1))
+                    if rate is not None:
+                        return {"rate": rate, "url": url, "method": "regex"}
+        except Exception as e:  # pragma: no cover - network failures are expected in some environments
+            last_error = e
+    raise RuntimeError(f"TPP kamuya açık referans verisi okunamadı: {last_error}")
 
 
 def derived_repo_rate_from_index(index_info: dict) -> float | None:
@@ -617,55 +602,40 @@ def refresh_public_reference_quotes(instruments_df: pd.DataFrame, quotes_df: pd.
         repo_rate = derived_repo_rate_from_index(repo_info)
         benchmarks["repo"] = repo_info | {"derived_rate": repo_rate}
         if repo_rate is not None and "repo_on" in instruments_df["instrument_id"].values:
-            existing = latest_quotes(quotes)
-            existing_repo = existing[existing["instrument_id"] == "repo_on"]
-            has_manual = (not existing_repo.empty) and bool(existing_repo.iloc[0].get("quote_confirmed", False))
-            if not has_manual:
-                row = build_quote_row(
-                    instrument_id="repo_on",
-                    gross_yield=repo_rate,
-                    fee_bps=2,
-                    tax_bps=0,
-                    quote_confirmed=False,
-                    capacity_available=True,
-                    source="BIST-KYD Repo (Gross) türetilmiş referans",
-                    notes="Kamuya açık endeks değişiminden türetilen referans; executable quote yerine benchmark olarak düşün.",
-                    valid_until=valid_until_by_cutoff("17:15"),
-                )
-                quotes = upsert_quote(quotes, row)
-                refreshed.append({"instrument_id": "repo_on", "label": "Repo referansı", "gross_yield": repo_rate, "source": row["source"]})
-            else:
-                refreshed.append({"instrument_id": "repo_on", "label": "Repo referansı", "gross_yield": repo_rate, "source": "Benchmark bulundu ama teyitli manuel quote korunuyor"})
+            row = build_quote_row(
+                instrument_id="repo_on",
+                gross_yield=repo_rate,
+                fee_bps=2,
+                tax_bps=0,
+                quote_confirmed=False,
+                capacity_available=True,
+                source="BIST-KYD Repo (Gross) türetilmiş referans",
+                notes="Kamuya açık endeks değişiminden türetilen referans; executable quote yerine benchmark olarak düşün.",
+                valid_until=valid_until_by_cutoff("17:15"),
+            )
+            quotes = upsert_quote(quotes, row)
+            refreshed.append({"instrument_id": "repo_on", "label": "Repo referansı", "gross_yield": repo_rate, "source": row["source"]})
     except Exception as e:
         errors.append(f"Repo benchmark çekilemedi: {e}")
 
     # TPP reference best effort
     try:
         tpp_info = fetch_tpp_public_reference()
-        if tpp_info is None:
-            errors.append("TPP kamuya açık sayfasından oran okunamadı; TPP için manuel override kullan.")
-        else:
-            benchmarks["tpp"] = tpp_info
-            if "tpp_on" in instruments_df["instrument_id"].values:
-                existing = latest_quotes(quotes)
-                existing_tpp = existing[existing["instrument_id"] == "tpp_on"]
-                has_manual = (not existing_tpp.empty) and bool(existing_tpp.iloc[0].get("quote_confirmed", False))
-                if not has_manual:
-                    row = build_quote_row(
-                        instrument_id="tpp_on",
-                        gross_yield=tpp_info["rate"],
-                        fee_bps=1,
-                        tax_bps=0,
-                        quote_confirmed=False,
-                        capacity_available=True,
-                        source="Takasbank kamuya açık referans",
-                        notes="Kamuya açık sayfadan best-effort çekim; mümkünse kurum ekranıyla teyit et.",
-                        valid_until=valid_until_by_cutoff("15:30"),
-                    )
-                    quotes = upsert_quote(quotes, row)
-                    refreshed.append({"instrument_id": "tpp_on", "label": "TPP referansı", "gross_yield": tpp_info["rate"], "source": row["source"]})
-                else:
-                    refreshed.append({"instrument_id": "tpp_on", "label": "TPP referansı", "gross_yield": tpp_info["rate"], "source": "Benchmark bulundu ama teyitli manuel quote korunuyor"})
+        benchmarks["tpp"] = tpp_info
+        if "tpp_on" in instruments_df["instrument_id"].values:
+            row = build_quote_row(
+                instrument_id="tpp_on",
+                gross_yield=tpp_info["rate"],
+                fee_bps=1,
+                tax_bps=0,
+                quote_confirmed=False,
+                capacity_available=True,
+                source="Takasbank kamuya açık referans",
+                notes="Kamuya açık sayfadan best-effort çekim; mümkünse kurum ekranıyla teyit et.",
+                valid_until=valid_until_by_cutoff("15:30"),
+            )
+            quotes = upsert_quote(quotes, row)
+            refreshed.append({"instrument_id": "tpp_on", "label": "TPP referansı", "gross_yield": tpp_info["rate"], "source": row["source"]})
     except Exception as e:
         errors.append(f"TPP benchmark çekilemedi: {e}")
 
@@ -827,10 +797,17 @@ def score_candidates(
 def init_state():
     if "instruments_df" not in st.session_state:
         st.session_state["instruments_df"] = load_default_csv("instruments_master.csv")
-    if "quotes_df" not in st.session_state:
-        st.session_state["quotes_df"] = load_default_csv("market_quotes.csv")
     if "rules_df" not in st.session_state:
         st.session_state["rules_df"] = load_default_csv("portfolio_rules.csv")
+    if "quotes_df" not in st.session_state:
+        base_quotes = load_default_csv("market_quotes.csv")
+        try:
+            sheet_quotes = fetch_google_quotes_csv(GOOGLE_QUOTES_CSV_URL)
+            st.session_state["quotes_df"] = merge_google_quotes(base_quotes, sheet_quotes, st.session_state["instruments_df"])
+            st.session_state["quotes_source_status"] = "Google Sheets canlı veri kullanılıyor."
+        except Exception as e:
+            st.session_state["quotes_df"] = base_quotes
+            st.session_state["quotes_source_status"] = f"Google Sheets okunamadı, yerel varsayılan quote'lar kullanılıyor: {e}"
     if "benchmarks" not in st.session_state:
         st.session_state["benchmarks"] = {}
 
@@ -843,22 +820,46 @@ st.caption("Repo / TPP / PPF / KVBAF / Mevduat / Katılım için iç kullanım k
 
 with st.sidebar:
     st.subheader("Veri Kaynağı")
-    st.write("İstersen örnek veriyle devam et, istersen kendi CSV'lerini yükleyip oturumu o veriyle başlat.")
+    st.caption("Repo ve TPP quote'ları Google Sheets içindeki canlı köprüden okunur. Instruments ve rules dosyaları yine repo içindeki CSV'lerden gelir.")
+    st.info(st.session_state.get("quotes_source_status", "-"))
+
     uploaded_instruments = st.file_uploader("instruments_master.csv", type=["csv"])
-    uploaded_quotes = st.file_uploader("market_quotes.csv", type=["csv"])
     uploaded_rules = st.file_uploader("portfolio_rules.csv", type=["csv"])
 
-    if st.button("Yüklenen dosyaları oturuma uygula", use_container_width=True):
-        st.session_state["instruments_df"] = load_csv_or_default(uploaded_instruments, "instruments_master.csv")
-        st.session_state["quotes_df"] = load_csv_or_default(uploaded_quotes, "market_quotes.csv")
-        st.session_state["rules_df"] = load_csv_or_default(uploaded_rules, "portfolio_rules.csv")
-        st.success("Yüklü dosyalar oturuma alındı.")
+    if st.button("Google Sheets quote'larını şimdi yenile", use_container_width=True):
+        try:
+            sheet_quotes = fetch_google_quotes_csv(GOOGLE_QUOTES_CSV_URL)
+            base_quotes = load_default_csv("market_quotes.csv")
+            st.session_state["quotes_df"] = merge_google_quotes(base_quotes, sheet_quotes, st.session_state["instruments_df"])
+            st.session_state["quotes_source_status"] = "Google Sheets canlı veri yenilendi."
+            st.success("Google Sheets quote'ları yenilendi.")
+        except Exception as e:
+            st.error(f"Google Sheets verisi okunamadı: {e}")
 
-    if st.button("Varsayılan örnek veriye dön", use_container_width=True):
+    if st.button("Yüklenen instruments/rules dosyalarını uygula", use_container_width=True):
+        st.session_state["instruments_df"] = load_csv_or_default(uploaded_instruments, "instruments_master.csv")
+        st.session_state["rules_df"] = load_csv_or_default(uploaded_rules, "portfolio_rules.csv")
+        try:
+            sheet_quotes = fetch_google_quotes_csv(GOOGLE_QUOTES_CSV_URL)
+            base_quotes = load_default_csv("market_quotes.csv")
+            st.session_state["quotes_df"] = merge_google_quotes(base_quotes, sheet_quotes, st.session_state["instruments_df"])
+            st.session_state["quotes_source_status"] = "Google Sheets canlı veri kullanılıyor."
+        except Exception as e:
+            st.session_state["quotes_df"] = load_default_csv("market_quotes.csv")
+            st.session_state["quotes_source_status"] = f"Google Sheets okunamadı, yerel varsayılan quote'lar kullanılıyor: {e}"
+        st.success("Dosyalar oturuma alındı.")
+
+    if st.button("Yerel varsayılan veriye dön", use_container_width=True):
         st.session_state["instruments_df"] = load_default_csv("instruments_master.csv")
-        st.session_state["quotes_df"] = load_default_csv("market_quotes.csv")
         st.session_state["rules_df"] = load_default_csv("portfolio_rules.csv")
-        st.success("Varsayılan örnek veri yüklendi.")
+        try:
+            sheet_quotes = fetch_google_quotes_csv(GOOGLE_QUOTES_CSV_URL)
+            st.session_state["quotes_df"] = merge_google_quotes(load_default_csv("market_quotes.csv"), sheet_quotes, st.session_state["instruments_df"])
+            st.session_state["quotes_source_status"] = "Google Sheets canlı veri kullanılıyor."
+        except Exception as e:
+            st.session_state["quotes_df"] = load_default_csv("market_quotes.csv")
+            st.session_state["quotes_source_status"] = f"Google Sheets okunamadı, yerel varsayılan quote'lar kullanılıyor: {e}"
+        st.success("Varsayılan veri yüklendi.")
 
 instruments, quotes, rules = clean_data(
     st.session_state["instruments_df"],
@@ -1003,10 +1004,9 @@ with tab2:
                 st.success(f"{len(refreshed)} fon güncellendi.")
                 st.dataframe(pd.DataFrame(refreshed), use_container_width=True, hide_index=True)
             if errors:
-                st.warning("Bazı fonlar güncellenemedi veya güvenilir okunamadı:")
+                st.warning("Bazı fonlar güncellenemedi:")
                 for err in errors:
                     st.write(f"- {err}")
-                st.info("Bu durumda mevcut CSV quote'larını koruyup yalnızca teyitli manuel quote ile devam et.")
 
     st.markdown("### 2) Kamuya açık referansları çek")
     st.caption("Repo ve TPP tarafında kamuya açık veriden best-effort referans üretir. İşlem yapılabilir oran yerine benchmark olarak düşün.")
@@ -1030,10 +1030,7 @@ with tab2:
     if single_submit:
         try:
             info = fetch_tefas_fund(tefas_code)
-            if info.get("annualized_proxy_pct", 0) <= 0:
-                st.warning("Fon sayfası açıldı ama getiri alanları güvenilir okunmadı. Bu fonu otomatik quote olarak kullanma.")
-            else:
-                st.success("Fon verisi çekildi.")
+            st.success("Fon verisi çekildi.")
             st.json(info)
         except Exception as e:
             st.error(f"Fon verisi çekilemedi: {e}")
@@ -1103,7 +1100,7 @@ with tab4:
         "1) Bu yeni app.py, requirements.txt ve data klasörünü GitHub repo'na yükle. "
         "2) Streamlit Cloud otomatik yeniden build edecek. "
         "3) App açılınca önce Otomatik Güncelle sekmesinde TEFAS fonlarını yenile. "
-        "4) Repo/TPP referansı çek. "
+        "4) Repo/TPP tarafı Google Sheets canlı köprüsünden gelir; manuel CSV upload gerektirmez. "
         "5) Mevduat ve katılım için yalnızca gelen gerçek banka quote'unu Manuel Quote sekmesinden gir. "
         "6) İstersen güncel CSV'leri indirip GitHub'a geri koy; böylece son veri repo'da kalıcı olur."
     )
@@ -1114,7 +1111,7 @@ with tab4:
         - TEFAS tarafı otomatik.
         - Repo ve TPP tarafında kamuya açık referans çekimi **best-effort** çalışır; kesin executable quote değildir.
         - Mevduat ve katılım oranı manuel kalır; çünkü gerçek banka quote'u gerekir.
-        - Streamlit Cloud kalıcı veritabanı değildir; bu yüzden istersen güncel CSV'leri indirip GitHub'a yükle.
+        - Repo ve TPP quote'ları Google Sheets köprüsünden okunur; CSV upload gerekmez.
         """
     )
 
