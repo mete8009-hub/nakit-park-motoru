@@ -199,6 +199,20 @@ def parse_google_rate(value, source: str = "") -> float | None:
     return round(n, 2)
 
 
+def _parse_sheet_timestamp(value) -> pd.Timestamp | pd.NaT:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return pd.NaT
+    s = str(value).strip()
+    if not s:
+        return pd.NaT
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return pd.Timestamp(datetime.strptime(s, fmt))
+        except Exception:
+            pass
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
+
+
 def _normalize_sheet_quotes(sheet_quotes: pd.DataFrame) -> pd.DataFrame:
     sheet_quotes = sheet_quotes.copy()
     needed = ["instrument_id", "instrument_name", "gross_yield", "net_yield", "quote_timestamp", "source", "notes"]
@@ -209,7 +223,7 @@ def _normalize_sheet_quotes(sheet_quotes: pd.DataFrame) -> pd.DataFrame:
     sheet_quotes["instrument_id"] = sheet_quotes["instrument_id"].astype(str).str.strip()
     sheet_quotes["gross_yield"] = [parse_google_rate(v, s) for v, s in zip(sheet_quotes["gross_yield"], sheet_quotes["source"])]
     sheet_quotes["net_yield"] = [parse_google_rate(v, s) for v, s in zip(sheet_quotes["net_yield"], sheet_quotes["source"])]
-    sheet_quotes["quote_timestamp"] = pd.to_datetime(sheet_quotes["quote_timestamp"], errors="coerce", dayfirst=True)
+    sheet_quotes["quote_timestamp"] = sheet_quotes["quote_timestamp"].apply(_parse_sheet_timestamp)
     return sheet_quotes.dropna(subset=["instrument_id"])
 
 
@@ -243,7 +257,12 @@ def merge_google_quotes(base_quotes: pd.DataFrame, sheet_quotes: pd.DataFrame, i
             out["quote_valid_until"] = pd.to_datetime(f"{current_ts.date()} {cutoff}", errors="coerce") if cutoff else pd.NaT
         out["gross_yield"] = row["gross_yield"]
         out["net_yield"] = row["net_yield"] if pd.notna(row["net_yield"]) else row["gross_yield"]
-        out["quote_timestamp"] = row["quote_timestamp"] if pd.notna(row["quote_timestamp"]) else pd.Timestamp(current_ts)
+        ts_value = row["quote_timestamp"] if pd.notna(row["quote_timestamp"]) else pd.Timestamp(current_ts)
+        if pd.notna(ts_value) and iid in {"repo_on", "tpp_on"}:
+            ts_value = pd.Timestamp(ts_value)
+            if ts_value.hour == 0 and ts_value.minute == 0 and ts_value.second == 0:
+                ts_value = pd.Timestamp(current_ts)
+        out["quote_timestamp"] = ts_value
         out["source"] = row.get("source", "Google Sheets") or "Google Sheets"
         out["notes"] = row.get("notes", "")
         out["quote_confirmed"] = True
@@ -954,9 +973,10 @@ st.session_state["rules_df"] = rules
 
 monitor_df = build_quote_monitor(quotes, instruments)
 repo_summary, tpp_summary = get_repo_tpp_summary(monitor_df)
-last_live_ts = monitor_df["quote_timestamp"].max() if not monitor_df.empty else pd.NaT
+live_bridge_df = monitor_df[monitor_df["instrument_id"].isin(["repo_on", "tpp_on"])].copy()
+last_live_ts = live_bridge_df["quote_timestamp"].max() if not live_bridge_df.empty else pd.NaT
 last_live_label = format_dt_tr(last_live_ts)
-stale_repo_tpp = monitor_df[monitor_df["instrument_id"].isin(["repo_on", "tpp_on"]) & (monitor_df["durum"] != "Güncel")]
+stale_repo_tpp = live_bridge_df[live_bridge_df["durum"] != "Güncel"]
 
 with st.sidebar:
     st.markdown("---")
@@ -975,9 +995,9 @@ with summary_cols[1]:
 with summary_cols[2]:
     render_metric_card("Son güncelleme", last_live_label, "Canlı quote zamanı")
 with summary_cols[3]:
-    fresh_count = int((monitor_df["durum"] == "Güncel").sum()) if not monitor_df.empty else 0
-    total_count = int(len(monitor_df)) if not monitor_df.empty else 0
-    render_metric_card("Güncel quote oranı", f"{fresh_count}/{total_count}", "Quote sağlığı")
+    fresh_count = int((live_bridge_df["durum"] == "Güncel").sum()) if not live_bridge_df.empty else 0
+    total_count = int(len(live_bridge_df)) if not live_bridge_df.empty else 0
+    render_metric_card("Canlı quote oranı", f"{fresh_count}/{total_count}", "Repo/TPP sağlığı")
 
 if not stale_repo_tpp.empty:
     st.warning("Repo veya TPP quote'larından en az biri eski ya da cutoff sonrası durumda. Karar vermeden önce quote yenile." )
