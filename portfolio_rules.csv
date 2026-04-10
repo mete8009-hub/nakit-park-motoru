@@ -1,5 +1,0 @@
-﻿portfolio_id,portfolio_name,participation_only_flag,government_only_flag,max_horizon_days,min_rating,allowed_instrument_types,notes
-GENEL,Genel Portföy,False,False,30,A,Repo|TersRepo|TPP|PPF|KVBAF|Mevduat|Katılım,Genel amaçlı örnek kural seti.
-LIKIT_FON,Likit Fon,False,False,7,AA,Repo|TersRepo|TPP|PPF|Mevduat,Kısa park ve yüksek likidite odaklı.
-KATILIM_FON,Katılım Fon,True,False,30,A,Katılım,Sadece katılım uyumlu ürünler.
-KAMU_ODAKLI,Kamu Odaklı Fon,False,True,14,AA,Repo|TersRepo|TPP|PPF,Kamu ağırlıklı veya düşük kredi riski tercih eden örnek fon.
