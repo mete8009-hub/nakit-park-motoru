@@ -1,5 +1,0 @@
-mandate_id,name,base_currency,allowed_asset_classes,allowed_currencies,min_rating,max_duration_years,min_liquidity_score,require_investment_grade,esg_floor,notes
-TRY_LIQ,TRY Likit Fon,TRY,Money Market|Fund|Fixed Income,TRY,A,1.0,75,1,0,Kısa vadeli TL likidite ve düşük duration odaklı.
-GLOBAL_BAL,Global Balanced,USD,ETF|Fund|Fixed Income|Money Market,USD|EUR|TRY,BBB,7.0,50,1,0,Çok varlıklı esnek kurumsal mandate.
-ESG_GROWTH,ESG Growth,USD,ETF|Fund,USD|EUR,NR,15.0,45,0,65,ESG ve tematik büyüme odaklı mandate.
-EUROBOND_INC,Eurobond Income,USD,Fixed Income|ETF,USD|EUR,BBB,10.0,40,1,0,Sovereign ve IG gelir odaklı yapı.
