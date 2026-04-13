@@ -1,0 +1,13 @@
+﻿instrument_id,instrument_name,quote_timestamp,quote_valid_until,gross_yield,fee_bps,tax_bps,net_yield,quote_confirmed,capacity_available,source,notes
+ppf_bgp,Ak Portföy Üçüncü Para Pi̇yasasi (Tl) Fonu,2026-04-08 16:07:33.108208,2026-04-08 13:30:00,38.87,10.0,0.0,38.77,True,True,TEFAS BGP,Günlük getiri %0.1065; 1A %3.01; proxy yıllıklandırılmış %38.87
+ppf_dly,Deni̇z Portföy Para Pi̇yasasi (Tl) Fonu,2026-04-08 16:07:20.603477,2026-04-08 13:30:00,38.0,10.0,0.0,37.9,True,True,TEFAS DLY,Günlük getiri %0.1041; 1A %3.05; proxy yıllıklandırılmış %38.00
+ppf_fil,Fi̇ba Portföy Para Pi̇yasasi (Tl) Fonu,2026-04-08 16:08:04.014566,2026-04-08 13:30:00,37.49,10.0,0.0,37.39,True,True,TEFAS FIL,Günlük getiri %0.1027; 1A %3.07; proxy yıllıklandırılmış %37.49
+ppf_hsl,Hsbc Portföy Para Pi̇yasasi (Tl) Fonu,2026-04-08 16:07:39.597419,2026-04-08 13:30:00,38.18,10.0,0.0,38.08,True,True,TEFAS HSL,Günlük getiri %0.1046; 1A %3.11; proxy yıllıklandırılmış %38.18
+ppf_ioo,İş Portföy İki̇nci̇ Para Pi̇yasasi (Tl) Fonu,2026-04-08 16:07:52.004055,2026-04-08 13:30:00,39.02,10.0,0.0,38.92,True,True,TEFAS IOO,Günlük getiri %0.1069; 1A %2.92; proxy yıllıklandırılmış %39.02
+ppf_ppn,Nurol Portföy Para Pi̇yasasi (Tl) Fonu,2026-04-08 16:07:46.014105,2026-04-08 13:30:00,40.22,10.0,0.0,40.12,True,True,TEFAS PPN,Günlük getiri %0.1102; 1A %3.25; proxy yıllıklandırılmış %40.22
+ppf_ppz,Azi̇mut Portföy Para Pi̇yasasi (Tl) Fonu,2026-04-08 16:07:57.698099,2026-04-08 13:30:00,35.81,10.0,0.0,35.71,True,True,TEFAS PPZ,Günlük getiri %0.0981; 1A %3.01; proxy yıllıklandırılmış %35.81
+ppf_pry,Pusula Portföy Para Pi̇yasasi (Tl) Fonu,2026-04-08 16:07:14.190219,2026-04-08 13:30:00,45.55,10.0,0.0,45.45,True,True,TEFAS PRY,Günlük getiri %0.1248; 1A %3.86; proxy yıllıklandırılmış %45.55
+ppf_tp2,Tera Portföy Para Pi̇yasasi (Tl) Fonu,2026-04-08 16:07:08.683102,2026-04-08 13:30:00,46.9,10.0,0.0,46.8,True,True,TEFAS TP2,Günlük getiri %0.1285; 1A %3.87; proxy yıllıklandırılmış %46.90
+ppf_zbj,Zi̇raat Portföy Başak Para Pi̇yasasi (Tl) Fonu,2026-04-08 16:07:26.598661,2026-04-08 13:30:00,40.04,10.0,0.0,39.94,True,True,TEFAS ZBJ,Günlük getiri %0.1097; 1A %3.16; proxy yıllıklandırılmış %40.04
+repo_on,BIST Repo O/N,2026-04-08 14:38:09.662055,2026-04-08 17:15:00,40.0,0.0,0.0,40.0,True,True,ForInvest Repo T0-ON,;;
+tpp_on,Takasbank Para Piyasası O/N,2026-04-08 16:10:50.138886,2026-04-08 15:30:00,40.95,0.0,0.0,40.95,True,True,ForInvest Takasbank 1G Son Oran,TAKAS_1 | Gün=1 | Son Oran=40.95 | Ort=41.09;;
